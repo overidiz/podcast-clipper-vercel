@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { extractKeywords, generateTags, generateHashtags, formatForExport } from "@/lib/seo";
 import { generateAllThumbnailsFromImage } from "@/lib/thumbnail";
 import { downloadFullVideo, cutVideo, type ClipJob } from "@/lib/clipper-wasm";
+import { createOpusProject, pollOpusProject } from "@/lib/opusclip";
 
 interface Topic {
   index: number;
@@ -108,6 +109,8 @@ type Tab = "topics" | "thumbs" | "export";
 export default function Home() {
   const [url, setUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [opusKey, setOpusKey] = useState("");
+  const [mode, setMode] = useState<"groq" | "opus">("groq");
   const [language, setLanguage] = useState("pt");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
@@ -137,8 +140,46 @@ export default function Home() {
       setVideoData(data);
       setStatus("Video extraido com sucesso!");
 
-      // If Groq key, do AI processing
-      if (apiKey && data.formats.length > 0) {
+      // OpusClip mode: submit to OpusClip API
+      if (mode === "opus" && opusKey) {
+        setStatus("Enviando para OpusClip...");
+        try {
+          const { projectId } = await createOpusProject(url, opusKey, {
+            title: data.title,
+            language,
+            clipDurations: [30, 180],
+          });
+
+          setStatus("OpusClip processando... (pode levar alguns minutos)");
+
+          const result = await pollOpusProject(projectId, opusKey, 600_000);
+
+          if (result.clips.length > 0) {
+            const t: Topic[] = result.clips.map((c, i) => ({
+              index: i + 1,
+              title: c.title,
+              summary: "",
+              start: c.startTime,
+              end: c.endTime,
+              duration: c.duration,
+            }));
+            setTopics(t);
+            setSeoTags([]);
+            setSeoHashtags([]);
+            setSeoDescription("");
+            generateCutScript(t, data.videoId);
+            setLoading(false);
+            setStatus("");
+            toast.success(`${t.length} clipes via OpusClip!`);
+            return;
+          }
+        } catch (e) {
+          toast.error(`OpusClip: ${e instanceof Error ? e.message : "Erro"}`);
+        }
+      }
+
+      // Groq mode: AI transcription + analysis
+      if (mode === "groq" && apiKey && data.formats.length > 0) {
         const audioFmt = data.formats.find(f =>
           f.mimeType.includes("audio")
         );
@@ -355,14 +396,35 @@ export default function Home() {
                 : <><Scissors className="w-4 h-4" />Processar</>}
             </button>
           </div>
-          <details className="text-xs text-muted-foreground">
-            <summary className="cursor-pointer hover:text-foreground">Usar Groq API (gratis — transcricao IA + topicos)</summary>
-            <div className="mt-2 flex gap-2">
-              <input type="password" placeholder="Groq API Key (console.groq.com)"
+          <div className="flex gap-2 items-center mt-2">
+            <span className="text-xs text-muted-foreground">Modo:</span>
+            <button
+              onClick={() => setMode("groq")}
+              className={`text-xs px-3 py-1 rounded-lg border transition-colors ${mode === "groq" ? "bg-tint/10 border-tint text-tint" : "bg-transparent border-muted text-muted-foreground"}`}
+            >
+              Groq (gratis)
+            </button>
+            <button
+              onClick={() => setMode("opus")}
+              className={`text-xs px-3 py-1 rounded-lg border transition-colors ${mode === "opus" ? "bg-tint/10 border-tint text-tint" : "bg-transparent border-muted text-muted-foreground"}`}
+            >
+              OpusClip (PRO)
+            </button>
+          </div>
+          {mode === "groq" && (
+            <div className="flex gap-2 mt-1">
+              <input type="password" placeholder="Groq API Key (gratis em console.groq.com)"
                 value={apiKey} onChange={e => setApiKey(e.target.value)} disabled={loading}
                 className="flex-1 h-9 px-3 bg-background border rounded-lg text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50" />
             </div>
-          </details>
+          )}
+          {mode === "opus" && (
+            <div className="flex gap-2 mt-1">
+              <input type="password" placeholder="OpusClip API Key (clip.opus.pro/dashboard)"
+                value={opusKey} onChange={e => setOpusKey(e.target.value)} disabled={loading}
+                className="flex-1 h-9 px-3 bg-background border rounded-lg text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50" />
+            </div>
+          )}
         </div>
       </div>
 
