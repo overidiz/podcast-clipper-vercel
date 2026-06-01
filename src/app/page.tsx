@@ -1,13 +1,13 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useRef } from "react";
 import {
-  Scissors, Film, Clock, Image, Tags, Download,
-  Sparkles, Play, Pencil, Check, Copy, Zap, Hash, FileText,
+  Scissors, Film, Clock, Image as ImageIcon, Tags, Download,
+  Sparkles, Pencil, Copy, Zap, Hash, FileText, AlertTriangle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { formatTime } from "@/lib/utils";
-import { generateAllThumbnails } from "@/lib/thumbnail";
+import { generateAllThumbnailsFromImage } from "@/lib/thumbnail";
 import { extractKeywords, generateTags, generateHashtags, formatForExport } from "@/lib/seo";
 
 interface Topic {
@@ -19,12 +19,20 @@ interface Topic {
   duration: number;
 }
 
-interface ClipResult {
+interface AppState {
+  videoId: string;
+  title: string;
+  duration: number;
+  thumbnail: string;
+  videoUrl: string | null;
   topics: Topic[];
   seoDescription: string;
   hashtags: string[];
   tags: string[];
   suggestedTitles: string[];
+  transcript: string;
+  segments: { start: number; end: number; text: string }[];
+  provider: string;
 }
 
 type Tab = "topics" | "thumbs" | "export";
@@ -35,24 +43,77 @@ export default function Home() {
   const [language, setLanguage] = useState("pt");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
-  const [statusDetail, setStatusDetail] = useState("");
-  const [result, setResult] = useState<ClipResult | null>(null);
+  const [state, setState] = useState<AppState | null>(null);
   const [editedTopics, setEditedTopics] = useState<Topic[]>([]);
   const [thumbnails, setThumbnails] = useState<{ index: number; title: string; url: string }[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("topics");
   const [generatingThumbs, setGeneratingThumbs] = useState(false);
   const [cutScript, setCutScript] = useState("");
-  const [localKeywords, setLocalKeywords] = useState<string[]>([]);
-  const [videoId, setVideoId] = useState("");
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const handleSubmit = async () => {
+    if (!url) return;
+    setLoading(true);
+    setStatus("Analisando video...");
+    setState(null);
+    setThumbnails([]);
+    setCutScript("");
+    setEditedTopics([]);
 
-  // Fallback: local keyword-based topic detection (no API needed)
-  const localAnalyze = useCallback((text: string, segments: { start: number; end: number; text: string }[]) => {
+    try {
+      const res = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url, language, apiKey: apiKey || undefined }),
+      });
+
+      const data = await res.json();
+
+      if (data.error) {
+        toast.error(data.error);
+        setLoading(false);
+        return;
+      }
+
+      // If Groq returned full analysis
+      if (data.topics && data.topics.length > 0) {
+        setState(data);
+        setEditedTopics(data.topics);
+        if (data.topics.length > 0) {
+          generateCutScript(data.topics, data.videoId);
+        }
+        setLoading(false);
+        setStatus("");
+        toast.success(`${data.topics.length} topicos detectados via ${data.provider || "IA"}!`);
+        return;
+      }
+
+      // Local mode: analyze transcript client-side if available
+      if (data.transcript && data.segments) {
+        const localResult = localAnalyze(data.transcript, data.segments);
+        setState({ ...data, ...localResult });
+        setEditedTopics(localResult.topics);
+        if (localResult.topics.length > 0) {
+          generateCutScript(localResult.topics, data.videoId);
+        }
+        setLoading(false);
+        setStatus("");
+        toast.success(`${localResult.topics.length} topicos detectados (modo local)!`);
+        return;
+      }
+
+      // Just video info, no transcription
+      setState(data);
+      setLoading(false);
+      setStatus("");
+      toast.info("Video encontrado! Adicione uma chave Groq para transcricao com IA.");
+    } catch (err) {
+      setLoading(false);
+      toast.error("Erro ao processar. Verifique sua conexao.");
+    }
+  };
+
+  const localAnalyze = (text: string, segments: { start: number; end: number; text: string }[]) => {
     const keywords = extractKeywords(text);
-    setLocalKeywords(keywords);
-
-    // Simple segmentation: group by paragraph size
     const topics: Topic[] = [];
     let currentText = "";
     let currentStart = segments[0]?.start || 0;
@@ -64,11 +125,7 @@ export default function Home() {
       currentEnd = seg.end;
 
       if (currentText.length > 500 || (seg.end - currentStart) > 180) {
-        const words = currentText.split(/\s+/);
-        const topWords = keywords.filter((k) =>
-          currentText.toLowerCase().includes(k)
-        ).slice(0, 5);
-
+        const topWords = keywords.filter((k) => currentText.toLowerCase().includes(k)).slice(0, 5);
         const title = topWords.length > 0
           ? topWords.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")
           : `Momento ${topics.length + 1}`;
@@ -83,13 +140,11 @@ export default function Home() {
             duration: currentEnd - currentStart,
           });
         }
-
         currentText = "";
         currentStart = seg.end;
       }
     }
 
-    // Last topic
     if (currentText.trim() && (currentEnd - currentStart) >= MIN_DURATION) {
       const topWords = keywords.filter((k) => currentText.toLowerCase().includes(k)).slice(0, 5);
       topics.push({
@@ -102,104 +157,33 @@ export default function Home() {
       });
     }
 
-    const tags = generateTags(keywords);
-    const hashtags = generateHashtags(keywords);
-
     return {
       topics,
       seoDescription: `${topics.length} topicos sobre ${keywords.slice(0, 4).join(", ")}`,
-      hashtags,
-      tags,
+      hashtags: generateHashtags(keywords),
+      tags: generateTags(keywords),
       suggestedTitles: topics.map((t) => t.title).slice(0, 3),
+      transcript: text,
+      segments,
+      provider: "local",
     };
-  }, []);
-
-  const handleSubmit = async () => {
-    if (!url) return;
-    setLoading(true);
-    setStatus("downloading");
-    setStatusDetail("Baixando audio do YouTube...");
-    setResult(null);
-    setThumbnails([]);
-    setCutScript("");
-
-    try {
-      // Download audio via API
-      const res = await fetch("/api/jobs", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url, language, apiKey: apiKey || undefined }),
-      });
-
-      const data = await res.json();
-
-      if (data.error) {
-        // Fallback: try local mode
-        if (data.fallback && data.transcript) {
-          setStatus("analyzing");
-          setStatusDetail("Analisando topicos localmente...");
-          const localResult = localAnalyze(data.transcript, data.segments);
-          setResult(localResult);
-          setEditedTopics(localResult.topics);
-          setVideoId(data.videoId || "");
-          if (localResult.topics.length > 0) {
-            generateCutScript(localResult.topics, data.videoId || "");
-          }
-          setLoading(false);
-          setStatus("completed");
-          toast.success(`${localResult.topics.length} topicos detectados (modo local gratuito)!`);
-          return;
-        }
-        toast.error(data.error);
-        setLoading(false);
-        return;
-      }
-
-      // Poll for completion
-      if (data.jobId) {
-        const poll = async () => {
-          const statusRes = await fetch(`/api/jobs?jobId=${data.jobId}`);
-          const job = await statusRes.json();
-
-          if (job.status === "completed") {
-            setResult(job.result);
-            setEditedTopics(job.result.topics);
-            setVideoId(job.result.videoId || "");
-            if (job.result.topics?.length > 0) {
-              generateCutScript(job.result.topics, job.result.videoId || "");
-            }
-            setLoading(false);
-            setStatus("completed");
-            toast.success(`${job.result.topics?.length || 0} topicos detectados!`);
-          } else if (job.status === "error") {
-            setLoading(false);
-            setStatus("error");
-            toast.error(job.result?.error || "Erro");
-          } else {
-            setStatus(job.status);
-            setStatusDetail(job.status === "transcribing" ? "Transcrevendo com Whisper..." : "Analisando topicos...");
-            setTimeout(poll, 3000);
-          }
-        };
-        poll();
-      }
-    } catch (err) {
-      setLoading(false);
-      toast.error("Erro ao processar. Verifique sua conexao.");
-    }
   };
 
   const generateCutScript = (topics: Topic[], vid: string) => {
     const lines = [
       "#!/bin/bash",
-      "# Podcast Clipper - Script de Corte",
+      "# ==========================================",
+      "# Podcast Clipper — Script de Corte de Video",
       `# Video: https://youtube.com/watch?v=${vid}`,
+      "# ==========================================",
       "",
-      `# Baixe o video antes de rodar este script:`,
-      `# yt-dlp -f "best[height<=1080]" -o "${vid}.mp4" "https://youtube.com/watch?v=${vid}"`,
+      "# 1. Baixe o video (1080p):",
+      `yt-dlp -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]" \\`,
+      `  -o "${vid}.mp4" "https://youtube.com/watch?v=${vid}"`,
       "",
+      "# 2. Corte os clips:",
       `INPUT="${vid}.mp4"`,
-      `mkdir -p output`,
+      "mkdir -p clips",
       "",
     ];
 
@@ -209,34 +193,89 @@ export default function Home() {
       const safe = t.title.replace(/[<>:"/\\|?*]/g, "").slice(0, 50);
       const num = String(t.index).padStart(2, "0");
       lines.push(
-        `echo "Cortando: ${t.title}"`,
+        `echo "🎬 ${t.title}"`,
         `ffmpeg -y -ss ${start} -i "$INPUT" -t ${dur} \\`,
         `  -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k \\`,
-        `  -movflags +faststart "output/${num}_${safe}.mp4"`,
+        `  -movflags +faststart "clips/${num}_${safe}.mp4"`,
         "",
       );
     });
 
-    lines.push(`echo "Concluido! ${topics.length} cortes em output/"`);
+    lines.push(`echo ""`);
+    lines.push(`echo "✅ ${topics.length} cortes prontos em clips/"`);
+    lines.push(`echo ""`);
+    lines.push(`echo "Titulos para YouTube Studio:"`);
+    topics.forEach((t) => {
+      lines.push(`echo "  ${t.index}. ${t.title}"`);
+    });
+
     setCutScript(lines.join("\n"));
   };
 
   const generateThumbnails = async () => {
-    if (!url) return;
+    if (!state?.thumbnail) return;
     setGeneratingThumbs(true);
     try {
-      const thumbs = await generateAllThumbnails(
-        url,
-        editedTopics.map((t) => ({ start: t.start, title: t.title })),
+      const thumbs = await generateAllThumbnailsFromImage(
+        state.thumbnail,
+        editedTopics.map((t) => ({ index: t.index, title: t.title })),
         { accentColor: "#eab308" }
       );
       setThumbnails(thumbs);
       setActiveTab("thumbs");
       toast.success(`${thumbs.length} thumbnails geradas!`);
-    } catch (err) {
-      toast.error("Erro ao gerar thumbnails. O video precisa estar disponivel.");
+    } catch {
+      toast.error("Erro ao gerar thumbnails. Tentando metodo alternativo...");
+      // Fallback: create text-only thumbnails
+      const fallback = await createFallbackThumbnails(editedTopics);
+      setThumbnails(fallback);
+      setActiveTab("thumbs");
     }
     setGeneratingThumbs(false);
+  };
+
+  const createFallbackThumbnails = async (topics: Topic[]) => {
+    const results = [];
+    for (const topic of topics) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1280;
+      canvas.height = 720;
+      const ctx = canvas.getContext("2d")!;
+
+      // Dark gradient bg
+      const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+      grad.addColorStop(0, "#0a0a2e");
+      grad.addColorStop(1, "#1a0a2e");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Accent bar
+      ctx.fillStyle = "#eab308";
+      ctx.fillRect(60, canvas.height / 2 - 40, 6, 64);
+
+      // Title
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 44px 'Geist', 'Inter', sans-serif";
+      const words = topic.title.split(" ");
+      let line = "";
+      let y = canvas.height / 2 - 10;
+      for (const word of words) {
+        const test = line + word + " ";
+        if (ctx.measureText(test).width > 1100 && line) {
+          ctx.fillText(line.trim(), 80, y);
+          line = word + " ";
+          y += 54;
+        } else {
+          line = test;
+        }
+      }
+      if (line.trim()) ctx.fillText(line.trim(), 80, y);
+
+      const blob = await new Promise<Blob>((res) => canvas.toBlob((b) => res(b!), "image/jpeg", 0.9));
+      const url = URL.createObjectURL(blob);
+      results.push({ index: topic.index, title: topic.title, url });
+    }
+    return results;
   };
 
   const updateTopic = (index: number, field: keyof Topic, value: string | number) => {
@@ -250,8 +289,7 @@ export default function Home() {
     toast.success(`${label} copiado!`);
   };
 
-  const seoDescription = result?.seoDescription
-    || `${editedTopics.length} cortes extraidos automaticamente do podcast. Assista os melhores momentos!`;
+  const hasTopics = editedTopics.length > 0;
 
   return (
     <main className="flex-1 max-w-5xl mx-auto w-full px-4 py-6 sm:py-10">
@@ -259,18 +297,18 @@ export default function Home() {
       <div className="text-center mb-8">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-tint/10 text-tint text-sm font-medium mb-4">
           <Zap className="w-4 h-4" />
-          100% Gratuito — processamento local
+          Gratuito — YouTube nativo + Groq IA
         </div>
         <h1 className="text-4xl sm:text-5xl font-bold tracking-tight mb-3">
           Podcast Clipper
         </h1>
         <p className="text-muted-foreground text-lg max-w-lg mx-auto">
-          Corte podcasts do YouTube com titulos, thumbnails e SEO automaticos.
-          Pronto pra upar no YouTube Studio.
+          Cortes de video com titulos, thumbnails e SEO automaticos.
+          Tudo pronto pra upar no YouTube Studio.
         </p>
       </div>
 
-      {/* Input Card */}
+      {/* Input */}
       <div className="bg-card border rounded-2xl p-5 mb-8">
         <div className="flex flex-col gap-3">
           <div className="flex flex-col sm:flex-row gap-3">
@@ -302,23 +340,16 @@ export default function Home() {
               className="h-12 px-6 bg-tint text-tint-foreground rounded-xl font-medium text-sm hover:opacity-90 disabled:opacity-50 transition-opacity flex items-center gap-2 shrink-0"
             >
               {loading ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-current/30 border-t-current rounded-full animate-spin" />
-                  {status === "downloading" ? "Baixando..." : status === "transcribing" ? "Whisper..." : "Analisando..."}
-                </>
+                <><div className="w-4 h-4 border-2 border-current/30 border-t-current rounded-full animate-spin" />{status}</>
               ) : (
-                <>
-                  <Scissors className="w-4 h-4" />
-                  Processar
-                </>
+                <><Scissors className="w-4 h-4" />Processar</>
               )}
             </button>
           </div>
 
-          {/* Groq API key (optional) */}
           <details className="text-xs text-muted-foreground">
             <summary className="cursor-pointer hover:text-foreground transition-colors">
-              Usar Groq API (Whisper + LLM gratuitos — mais preciso)
+              Usar Groq API (Whisper + IA gratis — titulos e SEO melhores)
             </summary>
             <div className="mt-2 flex gap-2">
               <input
@@ -331,43 +362,62 @@ export default function Home() {
               />
             </div>
             <p className="mt-1">
-              Sem chave = modo local gratuito (menos preciso, mas funciona).{" "}
-              <a href="https://console.groq.com" target="_blank" className="text-tint underline">Criar chave gratis</a>
+              <a href="https://console.groq.com" target="_blank" className="text-tint underline">Criar chave gratis no Groq</a> — sem chave o app funciona com metadados basicos.
             </p>
           </details>
         </div>
-
-        {loading && statusDetail && (
-          <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
-            <div className="w-3 h-3 border-2 border-tint/30 border-t-tint rounded-full animate-spin" />
-            {statusDetail}
-          </div>
-        )}
       </div>
 
-      {/* Results */}
-      {editedTopics.length > 0 && (
+      {/* Results: Video info (no transcription yet) */}
+      {state && !hasTopics && (
+        <div className="bg-card border rounded-2xl p-8 text-center">
+          <AlertTriangle className="w-12 h-12 mx-auto mb-4 text-warning" />
+          <h3 className="text-lg font-medium mb-2">Video encontrado!</h3>
+          <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
+            <strong>{state.title}</strong> — {Math.floor(state.duration / 60)}min
+          </p>
+          <p className="text-sm text-muted-foreground mb-2">
+            Para transcricao com IA e deteccao de topicos, adicione uma chave Groq gratuita.
+          </p>
+          <button
+            onClick={() => document.querySelector("details")?.setAttribute("open", "")}
+            className="text-sm text-tint hover:underline"
+          >
+            Adicionar chave Groq &rarr;
+          </button>
+        </div>
+      )}
+
+      {/* Results: Has topics */}
+      {hasTopics && (
         <div className="space-y-6">
           {/* Stats Bar */}
           <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground bg-card border rounded-xl px-4 py-3">
             <Clock className="w-4 h-4" />
             <span>{editedTopics.length} topicos</span>
             <span>•</span>
-            <FileText className="w-4 h-4" />
-            <span>SEO otimizado</span>
-            <span>•</span>
             <Hash className="w-4 h-4" />
-            <span>{result?.hashtags?.length || localKeywords.length} hashtags</span>
+            <span>{state?.hashtags?.length || 0} hashtags</span>
             <span>•</span>
-            <Image className="w-4 h-4" />
-            <span>{thumbnails.length > 0 ? `${thumbnails.length} thumbs` : "thumbs disponiveis"}</span>
+            <Tags className="w-4 h-4" />
+            <span>{state?.tags?.length || 0} tags SEO</span>
+            <span>•</span>
+            <ImageIcon className="w-4 h-4" />
+            <span>{thumbnails.length > 0 ? `${thumbnails.length} thumbs` : "thumbs"}</span>
+            {state?.provider && (
+              <>
+                <span>•</span>
+                <Sparkles className="w-4 h-4" />
+                <span className="text-tint">{state.provider === "groq" ? "Groq IA" : "Local"}</span>
+              </>
+            )}
           </div>
 
           {/* Tabs */}
           <div className="flex gap-1 bg-muted rounded-xl p-1">
             {([
               ["topics", "Topicos", Pencil],
-              ["thumbs", "Thumbnails", Image],
+              ["thumbs", "Thumbnails", ImageIcon],
               ["export", "Exportar", Download],
             ] as const).map(([tab, label, Icon]) => (
               <button
@@ -385,11 +435,11 @@ export default function Home() {
             ))}
           </div>
 
-          {/* Tab: Topics */}
+          {/* Topics Tab */}
           {activeTab === "topics" && (
             <div className="space-y-3">
               {editedTopics.map((topic) => (
-                <div key={topic.index} className="bg-card border rounded-xl p-4 hover:border-tint/30 transition-colors group">
+                <div key={topic.index} className="bg-card border rounded-xl p-4 hover:border-tint/30 transition-colors">
                   <div className="flex items-start gap-3">
                     <span className="text-xs font-mono bg-tint/10 text-tint px-2 py-1 rounded mt-1 shrink-0">
                       {String(topic.index).padStart(2, "0")}
@@ -415,26 +465,26 @@ export default function Home() {
             </div>
           )}
 
-          {/* Tab: Thumbnails */}
+          {/* Thumbnails Tab */}
           {activeTab === "thumbs" && (
             <div className="space-y-4">
               {thumbnails.length === 0 ? (
                 <div className="text-center py-12 bg-card border rounded-2xl">
-                  <Image className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
-                  <h3 className="font-medium mb-2">Thumbnails automaticas</h3>
+                  <ImageIcon className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
+                  <h3 className="font-medium mb-2">Thumbnails para YouTube</h3>
                   <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
-                    Gere thumbnails profissionais com titulo sobreposto, prontas pro YouTube.
-                    Extraidas diretamente do video nos momentos de cada topico.
+                    Geradas automaticamente com titulo sobreposto no estilo YouTube.
+                    Tamanho 1280x720, prontas pra upload.
                   </p>
                   <button
                     onClick={generateThumbnails}
-                    disabled={generatingThumbs || !url}
+                    disabled={generatingThumbs || !state?.thumbnail}
                     className="inline-flex items-center gap-2 px-5 py-2.5 bg-tint text-tint-foreground rounded-xl text-sm font-medium hover:opacity-90 disabled:opacity-50"
                   >
                     {generatingThumbs ? (
                       <><div className="w-4 h-4 border-2 border-current/30 border-t-current rounded-full animate-spin" /> Gerando...</>
                     ) : (
-                      <><Sparkles className="w-4 h-4" /> Gerar Thumbnails</>
+                      <><Sparkles className="w-4 h-4" /> Gerar {editedTopics.length} Thumbnails</>
                     )}
                   </button>
                 </div>
@@ -442,17 +492,13 @@ export default function Home() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   {thumbnails.map((thumb) => (
                     <div key={thumb.index} className="bg-card border rounded-xl overflow-hidden group">
-                      <img
-                        src={thumb.url}
-                        alt={thumb.title}
-                        className="w-full aspect-video object-cover"
-                      />
+                      <img src={thumb.url} alt={thumb.title} className="w-full aspect-video object-cover" />
                       <div className="p-3 flex items-center justify-between">
-                        <span className="text-xs font-medium truncate">{thumb.title}</span>
+                        <span className="text-xs font-medium truncate flex-1 mr-2">{thumb.title}</span>
                         <a
                           href={thumb.url}
-                          download={`thumb_${thumb.index}.jpg`}
-                          className="text-xs text-tint hover:underline flex items-center gap-1"
+                          download={`thumb_${String(thumb.index).padStart(2, "0")}.jpg`}
+                          className="text-xs text-tint hover:underline flex items-center gap-1 shrink-0"
                         >
                           <Download className="w-3 h-3" /> Baixar
                         </a>
@@ -464,139 +510,83 @@ export default function Home() {
             </div>
           )}
 
-          {/* Tab: Export */}
+          {/* Export Tab */}
           {activeTab === "export" && (
             <div className="space-y-4">
-              {/* SEO Description */}
+              {/* SEO */}
               <div className="bg-card border rounded-xl p-4">
                 <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-medium flex items-center gap-2">
-                    <Tags className="w-4 h-4" /> Descricao YouTube
-                  </h3>
-                  <button
-                    onClick={() => copyToClipboard(seoDescription, "Descricao")}
-                    className="text-xs text-tint hover:underline flex items-center gap-1"
-                  >
-                    <Copy className="w-3 h-3" /> Copiar
-                  </button>
+                  <h3 className="text-sm font-medium flex items-center gap-2"><Tags className="w-4 h-4" /> Descricao YouTube</h3>
+                  <button onClick={() => copyToClipboard(state?.seoDescription || "", "Descricao")} className="text-xs text-tint hover:underline flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                 </div>
-                <p className="text-sm text-muted-foreground bg-muted/50 rounded-lg p-3">{seoDescription}</p>
+                <p className="text-sm text-muted-foreground bg-muted/50 rounded-lg p-3">{state?.seoDescription || "Descricao nao disponivel"}</p>
               </div>
 
-              {/* Hashtags & Tags */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="bg-card border rounded-xl p-4">
                   <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-medium flex items-center gap-2">
-                      <Hash className="w-4 h-4" /> Hashtags
-                    </h3>
-                    <button
-                      onClick={() => copyToClipboard((result?.hashtags || localKeywords.map((k) => `#${k}`)).join(" "), "Hashtags")}
-                      className="text-xs text-tint hover:underline flex items-center gap-1"
-                    >
-                      <Copy className="w-3 h-3" /> Copiar
-                    </button>
+                    <h3 className="text-sm font-medium flex items-center gap-2"><Hash className="w-4 h-4" /> Hashtags</h3>
+                    <button onClick={() => copyToClipboard((state?.hashtags || []).join(" "), "Hashtags")} className="text-xs text-tint hover:underline flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {(result?.hashtags || localKeywords.map((k) => `#${k}`)).slice(0, 15).map((tag) => (
-                      <span key={tag} className="text-xs bg-tint/5 text-tint px-2 py-1 rounded-full">
-                        {tag.startsWith("#") ? tag : `#${tag}`}
-                      </span>
+                    {(state?.hashtags || []).slice(0, 15).map((tag) => (
+                      <span key={tag} className="text-xs bg-tint/5 text-tint px-2 py-1 rounded-full">{tag.startsWith("#") ? tag : `#${tag}`}</span>
                     ))}
                   </div>
                 </div>
-
                 <div className="bg-card border rounded-xl p-4">
                   <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-medium flex items-center gap-2">
-                      <Tags className="w-4 h-4" /> Tags
-                    </h3>
-                    <button
-                      onClick={() => copyToClipboard((result?.tags || localKeywords).join(", "), "Tags")}
-                      className="text-xs text-tint hover:underline flex items-center gap-1"
-                    >
-                      <Copy className="w-3 h-3" /> Copiar
-                    </button>
+                    <h3 className="text-sm font-medium flex items-center gap-2"><Tags className="w-4 h-4" /> Tags YouTube</h3>
+                    <button onClick={() => copyToClipboard((state?.tags || []).join(", "), "Tags")} className="text-xs text-tint hover:underline flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {(result?.tags || localKeywords).slice(0, 12).map((tag) => (
-                      <span key={tag} className="text-xs bg-secondary text-secondary-foreground px-2 py-1 rounded-full">
-                        {tag}
-                      </span>
+                    {(state?.tags || []).slice(0, 12).map((tag) => (
+                      <span key={tag} className="text-xs bg-secondary text-secondary-foreground px-2 py-1 rounded-full">{tag}</span>
                     ))}
                   </div>
                 </div>
               </div>
 
-              {/* Suggested Titles */}
-              {result?.suggestedTitles && result.suggestedTitles.length > 0 && (
+              {(state?.suggestedTitles?.length ?? 0) > 0 && (
                 <div className="bg-card border rounded-xl p-4">
-                  <h3 className="text-sm font-medium mb-3 flex items-center gap-2">
-                    <Sparkles className="w-4 h-4" /> Titulos sugeridos
-                  </h3>
+                  <h3 className="text-sm font-medium mb-3 flex items-center gap-2"><Sparkles className="w-4 h-4" /> Titulos sugeridos</h3>
                   <div className="space-y-2">
-                    {result.suggestedTitles.map((title, i) => (
+                    {state!.suggestedTitles!.map((title, i) => (
                       <div key={i} className="flex items-center gap-2 text-sm bg-muted/50 rounded-lg px-3 py-2">
                         <span className="text-xs text-muted-foreground">{i + 1}.</span>
                         <span className="flex-1">{title}</span>
-                        <button
-                          onClick={() => copyToClipboard(title, "Titulo")}
-                          className="text-xs text-tint hover:underline"
-                        >
-                          Copiar
-                        </button>
+                        <button onClick={() => copyToClipboard(title, "Titulo")} className="text-xs text-tint hover:underline">Copiar</button>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
 
-              {/* Cut Script */}
               {cutScript && (
                 <div className="bg-card border rounded-xl overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/50">
-                    <span className="text-sm font-medium flex items-center gap-2">
-                      <Download className="w-4 h-4" /> Script de Corte
-                    </span>
-                    <button
-                      onClick={() => copyToClipboard(cutScript, "Script")}
-                      className="text-xs text-tint hover:underline flex items-center gap-1"
-                    >
-                      <Copy className="w-3 h-3" /> Copiar
-                    </button>
+                    <span className="text-sm font-medium flex items-center gap-2"><Download className="w-4 h-4" /> Script de Corte (bash)</span>
+                    <button onClick={() => copyToClipboard(cutScript, "Script")} className="text-xs text-tint hover:underline flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                   </div>
-                  <pre className="p-4 text-xs font-mono text-muted-foreground overflow-x-auto max-h-64 overflow-y-auto">
-                    {cutScript}
-                  </pre>
+                  <pre className="p-4 text-xs font-mono text-muted-foreground overflow-x-auto max-h-80 overflow-y-auto">{cutScript}</pre>
+                  <div className="px-4 py-3 bg-muted/30 border-t">
+                    <p className="text-xs text-muted-foreground">
+                      Salve como <code className="bg-muted px-1 py-0.5 rounded">cortar.sh</code> e execute no terminal.
+                      Requer <strong>ffmpeg</strong> e <strong>yt-dlp</strong> instalados.
+                    </p>
+                  </div>
                 </div>
               )}
 
-              {/* Metadata TXT */}
               <div className="bg-card border rounded-xl overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/50">
-                  <span className="text-sm font-medium flex items-center gap-2">
-                    <FileText className="w-4 h-4" /> Metadados YouTube (TXT)
-                  </span>
-                  <button
-                    onClick={() => {
-                      const txt = formatForExport(editedTopics.map((t) => ({
-                        ...t,
-                        hashtags: result?.hashtags,
-                        tags: result?.tags,
-                      })));
-                      copyToClipboard(txt, "Metadados");
-                    }}
-                    className="text-xs text-tint hover:underline flex items-center gap-1"
-                  >
-                    <Copy className="w-3 h-3" /> Copiar
-                  </button>
+                  <span className="text-sm font-medium flex items-center gap-2"><FileText className="w-4 h-4" /> Metadados YouTube (TXT)</span>
+                  <button onClick={() => {
+                    copyToClipboard(formatForExport(editedTopics.map((t) => ({ ...t, hashtags: state?.hashtags, tags: state?.tags }))), "Metadados");
+                  }} className="text-xs text-tint hover:underline flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                 </div>
                 <pre className="p-4 text-xs font-mono text-muted-foreground overflow-x-auto max-h-48 overflow-y-auto">
-                  {formatForExport(editedTopics.map((t) => ({
-                    ...t,
-                    hashtags: result?.hashtags,
-                    tags: result?.tags,
-                  })))}
+                  {formatForExport(editedTopics.map((t) => ({ ...t, hashtags: state?.hashtags, tags: state?.tags })))}
                 </pre>
               </div>
             </div>
@@ -604,27 +594,22 @@ export default function Home() {
         </div>
       )}
 
-      {/* Empty State */}
-      {!loading && editedTopics.length === 0 && (
+      {/* Empty state */}
+      {!loading && !state && (
         <div className="text-center py-16">
           <div className="w-24 h-24 mx-auto mb-6 rounded-3xl bg-muted flex items-center justify-center">
             <Scissors className="w-10 h-10 text-muted-foreground" />
           </div>
           <h2 className="text-xl font-semibold mb-3">Cole um podcast do YouTube</h2>
           <p className="text-sm text-muted-foreground max-w-lg mx-auto mb-2">
-            <strong>100% gratuito.</strong> O app baixa o audio, transcreve, detecta topicos,
-            gera titulos, thumbnails e palavras-chave de SEO.
+            <strong>100% gratuito.</strong> Extrai audio/video do YouTube, transcreve com IA,
+            detecta topicos, gera titulos, thumbnails e SEO.
           </p>
           <p className="text-xs text-muted-foreground">
-            Com Groq API key = mais preciso (gratis em{" "}
-            <a href="https://console.groq.com" className="text-tint underline" target="_blank">console.groq.com</a>)
-            {" "}| Sem key = modo local gratuito
+            Com Groq API = mais preciso | Sem key = metadados basicos
           </p>
         </div>
       )}
-
-      {/* Hidden video for thumbnails */}
-      <video ref={videoRef} className="hidden" crossOrigin="anonymous" />
     </main>
   );
 }
