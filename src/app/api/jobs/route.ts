@@ -23,6 +23,7 @@ async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cookie": "CONSENT=YES+cb.20240501-00-p0.pt-PT+FX+988; SOCS=CAISNQgDEhJnd3NfMjAyNDA1MDFfMF9SQzEaAnB0IAEaBgiA9My9wQ;",
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -58,30 +59,40 @@ async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
     const details = playerResponse.videoDetails;
     if (!details) return null;
 
-    const formats: Record<string, unknown>[] = [
+    // Collect formats and resolve signatureCipher if needed
+    const rawFormats: Record<string, unknown>[] = [
       ...(playerResponse.streamingData?.adaptiveFormats || []),
       ...(playerResponse.streamingData?.formats || []),
     ];
 
-    if (formats.length === 0) return null;
+    if (rawFormats.length === 0) return null;
 
-    // Best audio-only format (any codec)
-    const audio = formats.find((f: Record<string, unknown>) => {
-      const mime = (f.mimeType as string) || "";
-      const hasAudio = mime.includes("audio") || (!mime.includes("video") && f.audioBitrate);
-      return hasAudio && !(f as Record<string, unknown>).qualityLabel;
+    const formats = rawFormats.map((f: Record<string, unknown>) => {
+      let url = f.url as string || "";
+      // Decode signatureCipher if no direct URL
+      if (!url && f.signatureCipher) {
+        const params = new URLSearchParams(f.signatureCipher as string);
+        url = params.get("url") || "";
+        const sig = params.get("s") || params.get("sp") || "";
+        if (sig && url) url += `&sig=${sig}`;
+      }
+      return { ...f, url };
     });
 
-    // Best video mp4 (any quality)
+    // Any format with audio and URL
+    const audio = formats.find((f: Record<string, unknown>) => {
+      const mime = (f.mimeType as string) || "";
+      const hasAudio = mime.includes("audio") || !!f.audioBitrate || !!f.audioChannels;
+      return hasAudio && !!f.url;
+    });
+
+    // Any video format with URL
     const video = formats.find((f: Record<string, unknown>) => {
       const mime = (f.mimeType as string) || "";
-      return mime.includes("video/mp4") && (f as Record<string, unknown>).qualityLabel === "720p";
+      return mime.includes("video/mp4") && !!f.url;
     }) || formats.find((f: Record<string, unknown>) => {
       const mime = (f.mimeType as string) || "";
-      return mime.includes("video/mp4");
-    }) || formats.find((f: Record<string, unknown>) => {
-      const mime = (f.mimeType as string) || "";
-      return mime.includes("video");
+      return mime.includes("video") && !!f.url;
     });
 
     const thumbs = details.thumbnail?.thumbnails || [];
