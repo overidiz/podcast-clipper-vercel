@@ -40,7 +40,83 @@ async function getVideoFromYouTube(url: string): Promise<VideoData> {
     throw new Error(err.error || "Video nao encontrado");
   }
 
-  return res.json();
+  const data = await res.json();
+
+  // Always try to get formats from browser (user's IP, no blocking)
+  if (!data.formats?.length && data.videoId) {
+    try {
+      const fresh = await fetchFormatsFromBrowser(data.videoId);
+      if (fresh.formats.length > 0) {
+        data.formats = fresh.formats;
+        data.title = data.title || fresh.title;
+        data.duration = data.duration || fresh.duration;
+      }
+    } catch {}
+  }
+
+  return data;
+}
+
+async function fetchFormatsFromBrowser(videoId: string): Promise<{ title: string; duration: number; formats: Record<string, unknown>[] }> {
+  // Call InnerTube API directly from browser (CORS is allowed by YouTube)
+  const apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const innerBody = JSON.stringify({
+    videoId,
+    context: {
+      client: {
+        clientName: "WEB",
+        clientVersion: "2.20250601.00.00",
+        hl: "pt",
+        gl: "BR",
+        utcOffsetMinutes: -180,
+      },
+    },
+  });
+
+  const innerRes = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`,
+    {
+      method: "POST",
+      mode: "cors",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: innerBody,
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+
+  if (!innerRes.ok) throw new Error(`HTTP ${innerRes.status}`);
+
+  const innerData = await innerRes.json();
+  const details = innerData.videoDetails || {};
+  const sd = innerData.streamingData || {};
+  const raw = [...(sd.adaptiveFormats || []), ...(sd.formats || [])];
+
+  const formats = raw
+    .map((f: Record<string, unknown>) => {
+      let u = (f.url as string) || "";
+      if (!u && f.signatureCipher) {
+        const p = new URLSearchParams(f.signatureCipher as string);
+        u = p.get("url") || "";
+        const s = p.get("s") || "";
+        if (s) u += `&sig=${s}`;
+      }
+      return {
+        url: u,
+        mimeType: (f.mimeType as string) || "",
+        itag: f.itag,
+        contentLength: f.contentLength,
+        qualityLabel: f.qualityLabel,
+      };
+    })
+    .filter((f: Record<string, unknown>) => f.url);
+
+  return {
+    title: (details.title as string) || "",
+    duration: parseInt((details.lengthSeconds as string) || "0", 10),
+    formats,
+  };
 }
 
 function formatTime(seconds: number): string {
