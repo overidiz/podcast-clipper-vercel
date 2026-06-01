@@ -24,15 +24,16 @@ async function getVideoFromInnerTube(videoId: string) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "com.google.ios.youtube/19.49.7 (iPhone; CPU iOS 18_2 like Mac OS X)",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Origin": "https://www.youtube.com",
+          "Referer": `https://www.youtube.com/watch?v=${videoId}`,
         },
         body: JSON.stringify({
           videoId,
           context: {
             client: {
-              clientName: "IOS",
-              clientVersion: "19.49.7",
-              deviceModel: "iPhone16,2",
+              clientName: "WEB",
+              clientVersion: "2.20250602.01.00",
               hl: "pt",
               gl: "BR",
               utcOffsetMinutes: -180,
@@ -69,8 +70,9 @@ async function getVideoFormats(videoId: string) {
     try {
       const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
         headers: {
-          "User-Agent": "com.google.ios.youtube/19.49.7 (iPhone; CPU iOS 18_2 like Mac OS X)",
-          "Accept-Language": "pt-BR",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Accept-Language": "pt-BR,pt;q=0.9",
+          "Accept": "text/html,application/xhtml+xml",
         },
         signal: AbortSignal.timeout(12000),
       });
