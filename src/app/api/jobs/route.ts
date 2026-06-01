@@ -22,6 +22,7 @@ async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -29,30 +30,59 @@ async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
 
-    // Extract ytInitialPlayerResponse JSON
-    const jsonMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});\s*var/);
-    if (!jsonMatch) return null;
+    // Extract ytInitialPlayerResponse JSON (robust brace matching)
+    const startMarker = "ytInitialPlayerResponse";
+    const startIdx = html.indexOf(startMarker);
+    if (startIdx === -1) return null;
 
-    const playerResponse = JSON.parse(jsonMatch[1]);
+    // Find the first { after the marker
+    const braceStart = html.indexOf("{", startIdx);
+    if (braceStart === -1) return null;
+
+    // Match braces to find the full JSON object
+    let depth = 0;
+    let endIdx = braceStart;
+    for (let i = braceStart; i < html.length; i++) {
+      if (html[i] === "{") depth++;
+      else if (html[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          endIdx = i + 1;
+          break;
+        }
+      }
+    }
+
+    const jsonStr = html.slice(braceStart, endIdx);
+    const playerResponse = JSON.parse(jsonStr);
     const details = playerResponse.videoDetails;
     if (!details) return null;
 
-    const formats: Record<string, unknown>[] =
-      playerResponse.streamingData?.adaptiveFormats || [];
+    const formats: Record<string, unknown>[] = [
+      ...(playerResponse.streamingData?.adaptiveFormats || []),
+      ...(playerResponse.streamingData?.formats || []),
+    ];
 
-    // Best audio (opus webm)
-    const audio = formats.find((f: Record<string, unknown>) =>
-      (f.mimeType as string)?.includes("audio") &&
-      !f.qualityLabel
-    );
+    if (formats.length === 0) return null;
 
-    // Best video (720p mp4, no audio)
-    const video = formats.find((f: Record<string, unknown>) =>
-      (f.mimeType as string)?.includes("video/mp4") &&
-      (f.qualityLabel as string) === "720p"
-    ) || formats.find((f: Record<string, unknown>) =>
-      (f.mimeType as string)?.includes("video/mp4")
-    );
+    // Best audio-only format (any codec)
+    const audio = formats.find((f: Record<string, unknown>) => {
+      const mime = (f.mimeType as string) || "";
+      const hasAudio = mime.includes("audio") || (!mime.includes("video") && f.audioBitrate);
+      return hasAudio && !(f as Record<string, unknown>).qualityLabel;
+    });
+
+    // Best video mp4 (any quality)
+    const video = formats.find((f: Record<string, unknown>) => {
+      const mime = (f.mimeType as string) || "";
+      return mime.includes("video/mp4") && (f as Record<string, unknown>).qualityLabel === "720p";
+    }) || formats.find((f: Record<string, unknown>) => {
+      const mime = (f.mimeType as string) || "";
+      return mime.includes("video/mp4");
+    }) || formats.find((f: Record<string, unknown>) => {
+      const mime = (f.mimeType as string) || "";
+      return mime.includes("video");
+    });
 
     const thumbs = details.thumbnail?.thumbnails || [];
 
