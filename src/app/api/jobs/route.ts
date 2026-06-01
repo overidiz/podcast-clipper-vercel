@@ -18,29 +18,31 @@ interface Format {
 }
 
 async function getVideoFromInnerTube(videoId: string) {
-  const res = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-      },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: "WEB",
-            clientVersion: "2.20250601.00.00",
-            hl: "pt",
-            gl: "BR",
-          },
+    const res = await fetch(
+      `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "com.google.ios.youtube/19.49.7 (iPhone; CPU iOS 18_2 like Mac OS X)",
         },
-        playbackContext: { contentPlaybackContext: { html5Preference: "HTML5_PREF_WANTS" } },
-      }),
-      signal: AbortSignal.timeout(12000),
-    }
-  );
+        body: JSON.stringify({
+          videoId,
+          context: {
+            client: {
+              clientName: "IOS",
+              clientVersion: "19.49.7",
+              deviceModel: "iPhone16,2",
+              hl: "pt",
+              gl: "BR",
+              utcOffsetMinutes: -180,
+            },
+          },
+          playbackContext: { contentPlaybackContext: { html5Preference: "HTML5_PREF_WANTS" } },
+        }),
+        signal: AbortSignal.timeout(12000),
+      }
+    );
 
   if (!res.ok) return null;
   return res.json();
@@ -67,7 +69,7 @@ async function getVideoFormats(videoId: string) {
     try {
       const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "User-Agent": "com.google.ios.youtube/19.49.7 (iPhone; CPU iOS 18_2 like Mac OS X)",
           "Accept-Language": "pt-BR",
         },
         signal: AbortSignal.timeout(12000),
