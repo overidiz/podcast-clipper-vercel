@@ -27,129 +27,19 @@ interface VideoData {
   formats: { url: string; mimeType: string; itag: number; contentLength?: string }[];
 }
 
-const CORS_PROXY = "https://api.allorigins.win/raw?url=";
-
-function extractVideoId(url: string): string {
-  const p = /(?:v=|\/v\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
-  const m = url.match(p);
-  if (m) return m[1];
-  throw new Error("URL invalida");
-}
-
-async function fetchViaProxy(url: string): Promise<string> {
-  // Try multiple CORS proxies
-  const proxies = [
-    (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-  ];
-
-  for (const proxyFn of proxies) {
-    try {
-      const res = await fetch(proxyFn(url), { signal: AbortSignal.timeout(15000) });
-      if (res.ok) return await res.text();
-    } catch {}
-  }
-  throw new Error("Nao foi possivel acessar o YouTube. Tente novamente.");
-}
-
 async function getVideoFromYouTube(url: string): Promise<VideoData> {
-  const videoId = extractVideoId(url);
+  const res = await fetch("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
 
-  // Try InnerTube API first
-  try {
-    const keyRes = await fetchViaProxy("https://www.youtube.com/");
-    const keyMatch = keyRes.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-    const apiKey = keyMatch?.[1] || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-
-    const innerTubeUrl = `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`;
-    const innerTubeBody = JSON.stringify({
-      videoId,
-      context: {
-        client: {
-          clientName: "WEB",
-          clientVersion: "2.20250601.00.00",
-          hl: "pt",
-          gl: "BR",
-          utcOffsetMinutes: -180,
-        },
-      },
-    });
-
-    // POST to InnerTube via proxy
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(innerTubeUrl)}`;
-    const proxyBody = `https://corsproxy.io/?${encodeURIComponent(`__POST__${encodeURIComponent(innerTubeBody)}`)}`;
-
-    // Actually, we need to POST. Let's try fetch directly with no-cors
-    try {
-      const directRes = await fetch(innerTubeUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: innerTubeBody,
-        signal: AbortSignal.timeout(12000),
-      });
-      if (directRes.ok) {
-        const data = await directRes.json();
-        if (data.videoDetails) {
-          return parseVideoData(videoId, data);
-        }
-      }
-    } catch {}
-
-    // Fallback: fetch watch page via proxy
-    const html = await fetchViaProxy(`https://www.youtube.com/watch?v=${videoId}`);
-
-    // Extract ytInitialPlayerResponse
-    const start = html.indexOf("ytInitialPlayerResponse");
-    if (start === -1) throw new Error("Video nao encontrado");
-
-    const braceStart = html.indexOf("{", start);
-    let depth = 0, endIdx = braceStart;
-    for (let i = braceStart; i < html.length; i++) {
-      if (html[i] === "{") depth++;
-      else if (html[i] === "}" && --depth === 0) { endIdx = i + 1; break; }
-    }
-
-    const data = JSON.parse(html.slice(braceStart, endIdx));
-    return parseVideoData(videoId, data);
-  } catch (e) {
-    throw e instanceof Error ? e : new Error("Erro ao acessar video");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "Erro ao acessar video" }));
+    throw new Error(err.error || "Video nao encontrado");
   }
-}
 
-function parseVideoData(videoId: string, data: Record<string, unknown>): VideoData {
-  const details = data.videoDetails as Record<string, unknown> || {};
-  const streamingData = data.streamingData as Record<string, unknown> || {};
-  const rawFormats = [
-    ...(streamingData.adaptiveFormats as Record<string, unknown>[] || []),
-    ...(streamingData.formats as Record<string, unknown>[] || []),
-  ];
-
-  const formats = rawFormats.map((f: Record<string, unknown>) => {
-    let url = (f.url as string) || "";
-    if (!url && f.signatureCipher) {
-      const p = new URLSearchParams(f.signatureCipher as string);
-      url = p.get("url") || "";
-      const s = p.get("s") || "";
-      if (s) url += `&sig=${s}`;
-    }
-    return {
-      url,
-      mimeType: (f.mimeType as string) || "",
-      itag: (f.itag as number) || 0,
-      contentLength: f.contentLength as string | undefined,
-    };
-  }).filter(f => f.url);
-
-  const thumbs = ((details.thumbnail as Record<string, unknown>)?.thumbnails as { url: string }[]) || [];
-
-  return {
-    videoId,
-    title: (details.title as string) || "Video",
-    duration: parseInt((details.lengthSeconds as string) || "0", 10),
-    thumbnail: thumbs[thumbs.length - 1]?.url || "",
-    formats,
-  };
+  return res.json();
 }
 
 function formatTime(seconds: number): string {
