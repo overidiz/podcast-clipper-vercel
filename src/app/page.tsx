@@ -57,65 +57,48 @@ async function getVideoFromYouTube(url: string): Promise<VideoData> {
 }
 
 async function fetchFormatsFromBrowser(videoId: string): Promise<{ title: string; duration: number; formats: Record<string, unknown>[] }> {
-  // Call InnerTube API directly from browser (CORS is allowed by YouTube)
-  const apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-  const innerBody = JSON.stringify({
-    videoId,
-    context: {
-      client: {
-        clientName: "WEB",
-        clientVersion: "2.20250601.00.00",
-        hl: "pt",
-        gl: "BR",
-        utcOffsetMinutes: -180,
-      },
-    },
-  });
+  // Use free YouTube info API - returns direct download URLs with CORS support
+  const loaderUrl = `https://loader.to/api/card/?url=https://www.youtube.com/watch?v=${videoId}&format=mp4`;
 
-  const innerRes = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`,
-    {
-      method: "POST",
-      mode: "cors",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: innerBody,
-      signal: AbortSignal.timeout(10000),
-    }
-  );
+  try {
+    const res = await fetch(loaderUrl, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
 
-  if (!innerRes.ok) throw new Error(`HTTP ${innerRes.status}`);
-
-  const innerData = await innerRes.json();
-  const details = innerData.videoDetails || {};
-  const sd = innerData.streamingData || {};
-  const raw = [...(sd.adaptiveFormats || []), ...(sd.formats || [])];
-
-  const formats = raw
-    .map((f: Record<string, unknown>) => {
-      let u = (f.url as string) || "";
-      if (!u && f.signatureCipher) {
-        const p = new URLSearchParams(f.signatureCipher as string);
-        u = p.get("url") || "";
-        const s = p.get("s") || "";
-        if (s) u += `&sig=${s}`;
-      }
+    if (data.success && data.video) {
       return {
-        url: u,
-        mimeType: (f.mimeType as string) || "",
-        itag: f.itag,
-        contentLength: f.contentLength,
-        qualityLabel: f.qualityLabel,
+        title: data.video.title || "",
+        duration: data.video.duration || 0,
+        formats: (data.video.formats || []).map((f: Record<string, unknown>) => ({
+          url: f.url as string,
+          mimeType: (f.mimeType || f.ext || "") as string,
+          itag: 0,
+          contentLength: f.size as string,
+          qualityLabel: f.quality as string,
+        })),
       };
-    })
-    .filter((f: Record<string, unknown>) => f.url);
+    }
+  } catch {}
 
-  return {
-    title: (details.title as string) || "",
-    duration: parseInt((details.lengthSeconds as string) || "0", 10),
-    formats,
-  };
+  // Fallback: y2mate-style API
+  try {
+    const res = await fetch(
+      `https://api.vevioz.com/@api/button/mp4/${videoId}`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data.url) {
+        return {
+          title: data.title || "",
+          duration: 0,
+          formats: [{ url: data.url as string, mimeType: "video/mp4", itag: 0 }],
+        };
+      }
+    }
+  } catch {}
+
+  throw new Error("Nenhuma API de download disponivel");
 }
 
 function formatTime(seconds: number): string {
