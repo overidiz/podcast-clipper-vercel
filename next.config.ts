@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["yt-dlp-wrap"],
+  serverExternalPackages: ["@distube/ytdl-core"],
   outputFileTracingIncludes: {
     "/api/jobs/*": ["./src/lib/**"],
   },

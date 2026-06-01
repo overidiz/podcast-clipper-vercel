@@ -1,23 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-
-const INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-const INNERTUBE_API = "https://www.youtube.com/youtubei/v1/player";
-
-interface Format {
-  itag: number;
-  url: string;
-  mimeType: string;
-  bitrate: number;
-  contentLength?: string;
-}
-
-interface VideoData {
-  videoId: string;
-  title: string;
-  duration: number;
-  thumbnails: { url: string; width: number; height: number }[];
-  formats: Format[];
-}
+// @ts-ignore
+import ytdl from "@distube/ytdl-core";
 
 function extractVideoId(url: string): string | null {
   const patterns = [
@@ -32,88 +15,51 @@ function extractVideoId(url: string): string | null {
   return null;
 }
 
-async function getVideoData(videoId: string): Promise<VideoData | null> {
+async function getVideoInfo(videoId: string) {
   try {
-    const res = await fetch(`${INNERTUBE_API}?key=${INNERTUBE_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: "WEB",
-            clientVersion: "2.20250601.00.00",
-            hl: "pt",
-            gl: "BR",
-            utcOffsetMinutes: -180,
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(12000),
-    });
+    const info = await ytdl.getInfo(videoId);
+    const formats = info.formats;
 
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (!data.streamingData) return null;
+    // Pick best audio (opus > m4a)
+    const audioFormat =
+      formats.find((f: { hasAudio: boolean; hasVideo: boolean; codecs?: string }) =>
+        f.hasAudio && !f.hasVideo && f.codecs?.includes("opus")
+      ) ||
+      formats.find((f: { hasAudio: boolean; hasVideo: boolean }) =>
+        f.hasAudio && !f.hasVideo
+      );
 
-    const details = data.videoDetails || {};
-    const thumbnails = details.thumbnail?.thumbnails || [];
+    // Pick best video (720p mp4)
+    const videoFormat =
+      formats.find((f: { hasVideo: boolean; hasAudio: boolean; qualityLabel?: string; container?: string }) =>
+        f.hasVideo && !f.hasAudio && f.qualityLabel === "720p" && f.container === "mp4"
+      ) ||
+      formats.find((f: { hasVideo: boolean; hasAudio: boolean; container?: string }) =>
+        f.hasVideo && !f.hasAudio && f.container === "mp4"
+      );
 
-    // Collect all adaptive formats
-    const adaptiveFormats: Format[] = (data.streamingData.adaptiveFormats || [])
-      .map((f: Record<string, unknown>) => ({
-        itag: f.itag as number,
-        url: f.url as string,
-        mimeType: (f.mimeType as string) || "",
-        bitrate: (f.bitrate as number) || 0,
-        contentLength: f.contentLength as string | undefined,
-      }));
+    // Get best thumbnail
+    const thumbs = info.videoDetails.thumbnails || [];
+    const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
 
     return {
       videoId,
-      title: details.title || "Video",
-      duration: parseInt(details.lengthSeconds || "0", 10),
-      thumbnails,
-      formats: adaptiveFormats,
+      title: info.videoDetails.title,
+      duration: parseInt(info.videoDetails.lengthSeconds || "0", 10),
+      thumbnail: bestThumb,
+      audioUrl: audioFormat?.url || null,
+      videoUrl: videoFormat?.url || null,
+      audioFormat: audioFormat
+        ? { itag: audioFormat.itag, mimeType: audioFormat.mimeType, contentLength: audioFormat.contentLength }
+        : null,
+      videoFormat: videoFormat
+        ? { itag: videoFormat.itag, mimeType: videoFormat.mimeType, contentLength: videoFormat.contentLength }
+        : null,
     };
-  } catch {
+  } catch (err) {
+    console.error("ytdl error:", err);
     return null;
   }
-}
-
-function pickAudioFormat(formats: Format[]): Format | null {
-  // Prefer opus > m4a > any audio
-  const opus = formats.find(
-    (f) => f.mimeType.includes("audio") && f.mimeType.includes("opus")
-  );
-  if (opus) return opus;
-
-  const m4a = formats.find(
-    (f) => f.mimeType.includes("audio") && f.mimeType.includes("mp4")
-  );
-  if (m4a) return m4a;
-
-  return formats.find((f) => f.mimeType.includes("audio")) || null;
-}
-
-function pickVideoFormat(formats: Format[]): Format | null {
-  // Prefer 1080p mp4 or lower for compatibility
-  const mp4_1080 = formats.find(
-    (f) => f.mimeType.includes("video/mp4") && f.itag === 137
-  );
-  if (mp4_1080) return mp4_1080;
-
-  const mp4_720 = formats.find(
-    (f) => f.mimeType.includes("video/mp4") && f.itag === 136
-  );
-  if (mp4_720) return mp4_720;
-
-  const mp4_360 = formats.find(
-    (f) => f.mimeType.includes("video/mp4") && f.itag === 135
-  );
-  if (mp4_360) return mp4_360;
-
-  return formats.find((f) => f.mimeType.includes("video/mp4")) || null;
 }
 
 export async function POST(req: NextRequest) {
@@ -124,72 +70,42 @@ export async function POST(req: NextRequest) {
     const videoId = extractVideoId(url);
     if (!videoId) return NextResponse.json({ error: "URL invalida do YouTube" }, { status: 400 });
 
-    // Get video metadata + stream URLs via YouTube InnerTube API
-    const videoData = await getVideoData(videoId);
-    if (!videoData) {
-      return NextResponse.json({
-        error: "Video nao encontrado ou indisponivel. Tente outro link.",
-      }, { status: 404 });
+    // Get video info via ytdl-core (pure JS, no external deps)
+    const info = await getVideoInfo(videoId);
+    if (!info) {
+      return NextResponse.json({ error: "Video nao encontrado ou indisponivel" }, { status: 404 });
     }
 
-    const audioFormat = pickAudioFormat(videoData.formats);
-    const videoFormat = pickVideoFormat(videoData.formats);
-
-    if (!audioFormat) {
-      return NextResponse.json({
-        error: "Nao foi possivel extrair audio do video. O video pode estar bloqueado.",
-      }, { status: 400 });
-    }
-
-    // Download audio for transcription
-    let audioBuffer: ArrayBuffer | null = null;
-    try {
-      const audioRes = await fetch(audioFormat.url, {
-        signal: AbortSignal.timeout(60000),
-      });
-      if (audioRes.ok) {
-        audioBuffer = await audioRes.arrayBuffer();
-      }
-    } catch {
-      // Will continue without audio
-    }
-
-    // Prepare response with video metadata
-    const response: Record<string, unknown> = {
-      videoId,
-      title: videoData.title,
-      duration: videoData.duration,
-      thumbnail: videoData.thumbnails?.[videoData.thumbnails.length - 1]?.url || "",
-      videoUrl: videoFormat?.url || null,
-      audioUrl: audioFormat.url,
-    };
-
-    // If Groq API key provided and we have audio, transcribe + analyze
-    if (apiKey && audioBuffer) {
+    // Download audio if Groq key provided
+    if (apiKey && info.audioUrl) {
       try {
-        const { transcribeWithGroq, analyzeWithGroq } = await import("@/lib/groq-client");
+        const audioRes = await fetch(info.audioUrl, { signal: AbortSignal.timeout(120000) });
+        if (audioRes.ok) {
+          const audioBuffer = await audioRes.arrayBuffer();
 
-        const transcript = await transcribeWithGroq(audioBuffer, apiKey, language);
-        const analysis = await analyzeWithGroq(transcript.text, transcript.segments, apiKey, language);
+          if (audioBuffer.byteLength <= 25 * 1024 * 1024) {
+            const { transcribeWithGroq, analyzeWithGroq } = await import("@/lib/groq-client");
+            const transcript = await transcribeWithGroq(audioBuffer, apiKey, language);
+            const analysis = await analyzeWithGroq(transcript.text, transcript.segments, apiKey, language);
 
-        return NextResponse.json({
-          ...response,
-          transcript: transcript.text,
-          segments: transcript.segments,
-          ...analysis,
-          provider: "groq",
-        });
+            return NextResponse.json({
+              ...info,
+              transcript: transcript.text,
+              segments: transcript.segments,
+              ...analysis,
+              provider: "groq",
+            });
+          }
+        }
       } catch (groqErr) {
         console.error("Groq error:", groqErr);
       }
     }
 
-    // Return video info for client-side processing
+    // Return video metadata
     return NextResponse.json({
-      ...response,
-      note: audioBuffer
-        ? "Audio extraido com sucesso. Use a chave Groq para transcricao com IA."
-        : "Audio nao pode ser baixado do servidor. Tente com a chave Groq.",
+      ...info,
+      note: "Video encontrado. Adicione chave Groq (gratis) para transcricao com IA e deteccao de topicos.",
     });
   } catch (err) {
     console.error(err);
