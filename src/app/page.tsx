@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Scissors, Film, Clock, Image as ImageIcon, Tags, Download,
-  Sparkles, Pencil, Copy, Zap, Hash, FileText,
+  Sparkles, Pencil, Copy, Zap, Hash, FileText, Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 import { extractKeywords, generateTags, generateHashtags, formatForExport } from "@/lib/seo";
@@ -107,6 +107,50 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const format = 1; // PCM
+  const bitsPerSample = 16;
+  const data = buffer.getChannelData(0);
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = data.length * blockAlign;
+  const headerSize = 44;
+  const totalSize = headerSize + dataSize;
+  const arrayBuffer = new ArrayBuffer(totalSize);
+  const view = new DataView(arrayBuffer);
+
+  // WAV header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, totalSize - 8, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, format, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < data.length; i++) {
+    const sample = Math.max(-1, Math.min(1, data[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+    offset += 2;
+  }
+  return arrayBuffer;
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+}
+
 type Tab = "topics" | "thumbs" | "export";
 
 export default function Home() {
@@ -127,6 +171,8 @@ export default function Home() {
   const [cutting, setCutting] = useState(false);
   const [cutProgress, setCutProgress] = useState({ current: 0, total: 0, status: "" });
   const [clips, setClips] = useState<{ index: number; title: string; blob: Blob; url: string }[]>([]);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSubmit = async () => {
     if (!url) return;
@@ -218,42 +264,53 @@ export default function Home() {
   const handleCut = async () => {
     if (!videoData || topics.length === 0) return;
 
-    const videoFmt = videoData.formats.find(f =>
-      f.mimeType.includes("video/mp4") && f.contentLength
-    ) || videoData.formats.find(f => f.mimeType.includes("video"));
-
-    const audioFmt = videoData.formats.find(f =>
-      f.mimeType.includes("audio")
-    );
-
-    // Prefer combined format (progressive) for simplicity
-    const bestFmt = videoData.formats.find(f =>
-      f.mimeType.includes("video/mp4") && f.url.includes("mime=video")
-    ) || videoFmt || audioFmt;
-
+    // Find a usable format
+    const bestFmt = videoData.formats.find(f => f.url) || null;
     if (!bestFmt?.url) {
       toast.error("Nenhum formato disponivel para download");
       return;
     }
 
-    const sizeMB = bestFmt.contentLength
-      ? parseInt(bestFmt.contentLength) / 1024 / 1024
-      : 0;
-
-    if (sizeMB > 500) {
-      toast.error(`Video muito grande (${sizeMB.toFixed(0)}MB). Use o script bash local.`);
-      return;
-    }
-
     setCutting(true);
     setClips([]);
-    setCutProgress({ current: 0, total: 0, status: "Baixando video..." });
+    setCutProgress({ current: 0, total: 0, status: "Carregando video..." });
 
     try {
-      // Download full video
-      const videoBuffer = await downloadFullVideo(bestFmt.url, (pct) => {
-        setCutProgress({ current: 0, total: topics.length, status: `Baixando video... ${pct}%` });
-      });
+      let videoBuffer: Uint8Array;
+
+      if (videoFile) {
+        // Local file: read directly
+        const total = videoFile.size;
+        const reader = videoFile.stream().getReader();
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          setCutProgress({ current: 0, total: topics.length, status: `Lendo arquivo... ${Math.round((received / total) * 100)}%` });
+        }
+        videoBuffer = new Uint8Array(received);
+        let offset = 0;
+        for (const chunk of chunks) {
+          videoBuffer.set(chunk, offset);
+          offset += chunk.length;
+        }
+      } else {
+        // YouTube format: download from URL
+        const sizeMB = bestFmt.contentLength
+          ? parseInt(bestFmt.contentLength) / 1024 / 1024
+          : 0;
+        if (sizeMB > 500) {
+          toast.error(`Video muito grande (${sizeMB.toFixed(0)}MB). Use o upload de arquivo.`);
+          setCutting(false);
+          return;
+        }
+        videoBuffer = await downloadFullVideo(bestFmt.url, (pct) => {
+          setCutProgress({ current: 0, total: topics.length, status: `Baixando video... ${pct}%` });
+        });
+      }
 
       // Cut clips
       const clipJobs: ClipJob[] = topics.map(t => ({
@@ -316,6 +373,66 @@ export default function Home() {
     setTopics(prev => prev.map(t => t.index === index ? { ...t, [field]: value } : t));
   };
 
+  const handleFileUpload = async (file: File) => {
+    if (!file.type.startsWith("video/")) {
+      toast.error("Selecione um arquivo de video (MP4)");
+      return;
+    }
+    setVideoFile(file);
+    setVideoData({
+      videoId: file.name.replace(/\.[^.]+$/, ""),
+      title: file.name.replace(/\.[^.]+$/, ""),
+      duration: 0,
+      thumbnail: "",
+      formats: [{ url: URL.createObjectURL(file), mimeType: file.type, itag: 0, contentLength: String(file.size) }],
+    });
+    setTopics([]);
+    setClips([]);
+    setThumbnails([]);
+
+    // Try Groq if key provided
+    if (apiKey) {
+      setLoading(true);
+      setStatus("Extraindo audio...");
+      try {
+        const audioCtx = new AudioContext();
+        const arrayBuffer = await file.arrayBuffer();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+        // Convert to WAV
+        const wav = audioBufferToWav(audioBuffer);
+        if (wav.byteLength <= 25 * 1024 * 1024) {
+          setStatus("Transcrevendo com IA...");
+          const { transcribeWithGroq, analyzeWithGroq } = await import("@/lib/groq-client");
+          const transcript = await transcribeWithGroq(wav, apiKey, language);
+          const analysis = await analyzeWithGroq(transcript.text, transcript.segments, apiKey, language);
+
+          if (analysis.topics.length > 0) {
+            setTopics(analysis.topics);
+            setSeoTags(analysis.tags);
+            setSeoHashtags(analysis.hashtags);
+            setSeoDescription(analysis.seoDescription);
+            generateCutScript(analysis.topics, videoData!.videoId);
+            setLoading(false);
+            setStatus("");
+            toast.success(`${analysis.topics.length} topicos via IA!`);
+            return;
+          }
+        }
+      } catch {
+        toast.error("Transcricao falhou. Tente sem a chave Groq.");
+      }
+      setLoading(false);
+      setStatus("");
+    } else {
+      const kw = extractKeywords(file.name);
+      setSeoTags(generateTags(kw));
+      setSeoHashtags(generateHashtags(kw));
+      setSeoDescription(file.name);
+      toast.success("Video carregado! Cole a chave Groq para IA ou corte manualmente.");
+    }
+  };
+
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
     toast.success(`${label} copiado!`);
@@ -368,6 +485,52 @@ export default function Home() {
             </div>
             <p className="mt-1">Sem chave: metadados + corte basico. Com chave: transcricao IA, topicos, titulos e SEO automaticos.</p>
           </details>
+
+          {/* File drop zone */}
+          <div
+            className="mt-3 border-2 border-dashed rounded-xl p-6 text-center hover:border-tint/50 transition-colors cursor-pointer"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add("border-tint"); }}
+            onDragLeave={(e) => e.currentTarget.classList.remove("border-tint")}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.currentTarget.classList.remove("border-tint");
+              const file = e.dataTransfer.files[0];
+              if (file) handleFileUpload(file);
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/mp4,video/webm,video/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleFileUpload(file);
+              }}
+            />
+            {videoFile ? (
+              <div className="flex items-center justify-center gap-2 text-sm">
+                <Film className="w-4 h-4 text-tint" />
+                <span className="text-tint font-medium">{videoFile.name}</span>
+                <span className="text-muted-foreground">({(videoFile.size / 1024 / 1024).toFixed(1)} MB)</span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setVideoFile(null); setVideoData(null); setTopics([]); }}
+                  className="text-xs text-muted-foreground hover:text-destructive ml-2"
+                >
+                  remover
+                </button>
+              </div>
+            ) : (
+              <div>
+                <Upload className="w-8 h-8 mx-auto mb-2 text-muted-foreground" />
+                <p className="text-sm text-muted-foreground">
+                  Ou arraste um arquivo de video aqui
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">MP4, WebM — corta sem precisar baixar do YouTube</p>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
