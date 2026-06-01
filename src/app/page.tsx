@@ -41,64 +41,8 @@ async function getVideoFromYouTube(url: string): Promise<VideoData> {
 
   const data = await res.json();
 
-  // Always try to get formats from browser (user's IP, no blocking)
-  if (!data.formats?.length && data.videoId) {
-    try {
-      const fresh = await fetchFormatsFromBrowser(data.videoId);
-      if (fresh.formats.length > 0) {
-        data.formats = fresh.formats;
-        data.title = data.title || fresh.title;
-        data.duration = data.duration || fresh.duration;
-      }
-    } catch {}
-  }
-
+  // Server returned all available formats - use as-is
   return data;
-}
-
-async function fetchFormatsFromBrowser(videoId: string): Promise<{ title: string; duration: number; formats: Record<string, unknown>[] }> {
-  // Use free YouTube info API - returns direct download URLs with CORS support
-  const loaderUrl = `https://loader.to/api/card/?url=https://www.youtube.com/watch?v=${videoId}&format=mp4`;
-
-  try {
-    const res = await fetch(loaderUrl, { signal: AbortSignal.timeout(12000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    if (data.success && data.video) {
-      return {
-        title: data.video.title || "",
-        duration: data.video.duration || 0,
-        formats: (data.video.formats || []).map((f: Record<string, unknown>) => ({
-          url: f.url as string,
-          mimeType: (f.mimeType || f.ext || "") as string,
-          itag: 0,
-          contentLength: f.size as string,
-          qualityLabel: f.quality as string,
-        })),
-      };
-    }
-  } catch {}
-
-  // Fallback: y2mate-style API
-  try {
-    const res = await fetch(
-      `https://api.vevioz.com/@api/button/mp4/${videoId}`,
-      { signal: AbortSignal.timeout(10000) }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      if (data.url) {
-        return {
-          title: data.title || "",
-          duration: 0,
-          formats: [{ url: data.url as string, mimeType: "video/mp4", itag: 0 }],
-        };
-      }
-    }
-  } catch {}
-
-  throw new Error("Nenhuma API de download disponivel");
 }
 
 function formatTime(seconds: number): string {
@@ -699,9 +643,23 @@ export default function Home() {
 
           {topics.length === 0 && videoData && (
             <div className="text-center py-8 bg-card border rounded-2xl">
-              <Sparkles className="w-8 h-8 mx-auto mb-3 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground mb-2">Adicione a chave Groq (gratis) para transcricao com IA e deteccao de topicos.</p>
-              <button onClick={generateThumbnails} className="text-sm text-tint hover:underline">Gerar thumbnail do video</button>
+              <Upload className="w-10 h-10 mx-auto mb-3 text-muted-foreground" />
+              <p className="text-sm font-medium mb-1">{videoData.title}</p>
+              <p className="text-xs text-muted-foreground mb-3">
+                {videoData.duration > 0 ? `${Math.floor(videoData.duration / 60)}min` : ""}
+                {videoFile ? " — Arquivo carregado!" : " — Link detectado. Para cortar, faca upload do MP4 abaixo."}
+              </p>
+              {!videoFile && (
+                <p className="text-xs text-tint">
+                  Arraste o arquivo MP4 do podcast na area de upload acima
+                </p>
+              )}
+              {!apiKey && (
+                <p className="text-xs text-muted-foreground mt-2">
+                  Com chave Groq: IA detecta topicos, titulos e SEO automaticos
+                </p>
+              )}
+              <button onClick={generateThumbnails} className="text-sm text-tint hover:underline mt-2 block mx-auto">Gerar thumbnail</button>
             </div>
           )}
         </div>
