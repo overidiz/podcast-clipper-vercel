@@ -39,7 +39,62 @@ async function getVideoFromYouTube(url: string): Promise<VideoData> {
     throw new Error(err.error || "Video nao encontrado");
   }
 
-  return res.json();
+  const data = await res.json();
+
+  // If server got formats, return directly
+  if (data.formats?.length > 0) return data;
+
+  // Try client-side: fetch InnerTube API from browser (user's IP, no blocking)
+  const videoId = data.videoId;
+  if (videoId) {
+    try {
+      const innerRes = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            videoId,
+            context: {
+              client: {
+                clientName: "WEB",
+                clientVersion: "2.20250601.00.00",
+                hl: "pt", gl: "BR", utcOffsetMinutes: -180,
+              },
+            },
+          }),
+          signal: AbortSignal.timeout(10000),
+        }
+      );
+      if (innerRes.ok) {
+        const innerData = await innerRes.json();
+        if (innerData.streamingData) {
+          const sd = innerData.streamingData;
+          const raw = [...(sd.adaptiveFormats || []), ...(sd.formats || [])];
+          data.formats = raw
+            .map((f: Record<string, unknown>) => {
+              let u = (f.url as string) || "";
+              if (!u && f.signatureCipher) {
+                const p = new URLSearchParams(f.signatureCipher as string);
+                u = p.get("url") || "";
+                const s = p.get("s") || "";
+                if (s) u += `&sig=${s}`;
+              }
+              return { url: u, mimeType: f.mimeType || "", itag: f.itag, contentLength: f.contentLength, qualityLabel: f.qualityLabel };
+            })
+            .filter((f: Record<string, unknown>) => f.url);
+        }
+        if (innerData.videoDetails) {
+          data.title = data.title || innerData.videoDetails.title;
+          data.duration = data.duration || parseInt(innerData.videoDetails.lengthSeconds || "0", 10);
+        }
+      }
+    } catch {
+      // Client-side InnerTube failed, no formats available
+    }
+  }
+
+  return data;
 }
 
 function formatTime(seconds: number): string {
