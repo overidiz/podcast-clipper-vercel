@@ -6,109 +6,121 @@ function extractVideoId(url: string): string | null {
   return m ? m[1] : url.length === 11 ? url : null;
 }
 
-interface VideoInfo {
-  videoId: string;
-  title: string;
-  duration: number;
-  thumbnail: string;
-  audioUrl: string | null;
-  videoUrl: string | null;
+const INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+
+interface Format {
+  url?: string;
+  signatureCipher?: string;
+  mimeType?: string;
+  itag?: number;
+  qualityLabel?: string;
+  audioBitrate?: number;
 }
 
-async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
-  try {
-    // Fetch YouTube watch page and extract ytInitialPlayerResponse
-    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+async function getVideoFromInnerTube(videoId: string) {
+  const res = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}`,
+    {
+      method: "POST",
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cookie": "CONSENT=YES+cb.20240501-00-p0.pt-PT+FX+988; SOCS=CAISNQgDEhJnd3NfMjAyNDA1MDFfMF9SQzEaAnB0IAEaBgiA9My9wQ;",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
       },
-      signal: AbortSignal.timeout(15000),
-    });
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20250601.00.00",
+            hl: "pt",
+            gl: "BR",
+          },
+        },
+        playbackContext: { contentPlaybackContext: { html5Preference: "HTML5_PREF_WANTS" } },
+      }),
+      signal: AbortSignal.timeout(12000),
+    }
+  );
 
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+  if (!res.ok) return null;
+  return res.json();
+}
 
-    // Extract ytInitialPlayerResponse JSON (robust brace matching)
-    const startMarker = "ytInitialPlayerResponse";
-    const startIdx = html.indexOf(startMarker);
-    if (startIdx === -1) return null;
+function resolveUrl(f: Format): string {
+  if (f.url) return f.url;
+  if (f.signatureCipher) {
+    const p = new URLSearchParams(f.signatureCipher);
+    const url = p.get("url") || "";
+    const s = p.get("s") || "";
+    if (s) return `${url}&sig=${s}`;
+    return url;
+  }
+  return "";
+}
 
-    // Find the first { after the marker
-    const braceStart = html.indexOf("{", startIdx);
-    if (braceStart === -1) return null;
+async function getVideoFormats(videoId: string) {
+  // Try InnerTube API first
+  let data = await getVideoFromInnerTube(videoId);
 
-    // Match braces to find the full JSON object
-    let depth = 0;
-    let endIdx = braceStart;
-    for (let i = braceStart; i < html.length; i++) {
-      if (html[i] === "{") depth++;
-      else if (html[i] === "}") {
-        depth--;
-        if (depth === 0) {
-          endIdx = i + 1;
-          break;
+  // Fallback: try HTML parsing
+  if (!data?.streamingData) {
+    try {
+      const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "Accept-Language": "pt-BR",
+        },
+        signal: AbortSignal.timeout(12000),
+      });
+      if (pageRes.ok) {
+        const html = await pageRes.text();
+        const start = html.indexOf("ytInitialPlayerResponse") ;
+        if (start !== -1) {
+          const braceStart = html.indexOf("{", start);
+          if (braceStart !== -1) {
+            let depth = 0, endIdx = braceStart;
+            for (let i = braceStart; i < html.length; i++) {
+              if (html[i] === "{") depth++;
+              else if (html[i] === "}" && --depth === 0) { endIdx = i + 1; break; }
+            }
+            try { data = JSON.parse(html.slice(braceStart, endIdx)); } catch {}
+          }
         }
       }
-    }
-
-    const jsonStr = html.slice(braceStart, endIdx);
-    const playerResponse = JSON.parse(jsonStr);
-    const details = playerResponse.videoDetails;
-    if (!details) return null;
-
-    // Collect formats and resolve signatureCipher if needed
-    const rawFormats: Record<string, unknown>[] = [
-      ...(playerResponse.streamingData?.adaptiveFormats || []),
-      ...(playerResponse.streamingData?.formats || []),
-    ];
-
-    if (rawFormats.length === 0) return null;
-
-    const formats = rawFormats.map((f: Record<string, unknown>) => {
-      let url = f.url as string || "";
-      // Decode signatureCipher if no direct URL
-      if (!url && f.signatureCipher) {
-        const params = new URLSearchParams(f.signatureCipher as string);
-        url = params.get("url") || "";
-        const sig = params.get("s") || params.get("sp") || "";
-        if (sig && url) url += `&sig=${sig}`;
-      }
-      return { ...f, url };
-    });
-
-    // Any format with audio and URL
-    const audio = formats.find((f: Record<string, unknown>) => {
-      const mime = (f.mimeType as string) || "";
-      const hasAudio = mime.includes("audio") || !!f.audioBitrate || !!f.audioChannels;
-      return hasAudio && !!f.url;
-    });
-
-    // Any video format with URL
-    const video = formats.find((f: Record<string, unknown>) => {
-      const mime = (f.mimeType as string) || "";
-      return mime.includes("video/mp4") && !!f.url;
-    }) || formats.find((f: Record<string, unknown>) => {
-      const mime = (f.mimeType as string) || "";
-      return mime.includes("video") && !!f.url;
-    });
-
-    const thumbs = details.thumbnail?.thumbnails || [];
-
-    return {
-      videoId,
-      title: (details.title as string) || "Video",
-      duration: parseInt((details.lengthSeconds as string) || "0", 10),
-      thumbnail: thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "",
-      audioUrl: (audio?.url as string) || null,
-      videoUrl: (video?.url as string) || null,
-    };
-  } catch (err) {
-    console.error("getVideoInfo error:", err);
-    return null;
+    } catch {}
   }
+
+  if (!data?.streamingData) return null;
+
+  const details = data.videoDetails || {};
+  const rawFormats: Format[] = [
+    ...(data.streamingData.adaptiveFormats || []),
+    ...(data.streamingData.formats || []),
+  ];
+
+  // Resolve URLs
+  const formats = rawFormats.map((f) => ({ ...f, url: resolveUrl(f) }));
+
+  // Pick best audio
+  const audio = formats.find((f: Format) =>
+    f.url && (f.mimeType?.includes("audio") || !!f.audioBitrate)
+  );
+
+  // Pick best video (720p mp4)
+  const video = formats.find((f: Format) =>
+    f.url && f.mimeType?.includes("video/mp4")
+  );
+
+  const thumbs = (details.thumbnail?.thumbnails as { url: string }[]) || [];
+
+  return {
+    videoId,
+    title: (details.title as string) || "Video",
+    duration: parseInt((details.lengthSeconds as string) || "0", 10),
+    thumbnail: thumbs[thumbs.length - 1]?.url || "",
+    audioUrl: audio?.url || null,
+    videoUrl: video?.url || null,
+  };
 }
 
 export async function POST(req: NextRequest) {
@@ -119,51 +131,35 @@ export async function POST(req: NextRequest) {
     const videoId = extractVideoId(url);
     if (!videoId) return NextResponse.json({ error: "URL invalida" }, { status: 400 });
 
-    const info = await getVideoInfo(videoId);
+    const info = await getVideoFormats(videoId);
     if (!info) {
       return NextResponse.json({
-        error: "Nao foi possivel acessar o video. Verifique se o link esta correto e se o video e publico.",
+        error: "Nao foi possivel acessar o video. Tente outro link.",
       }, { status: 404 });
     }
 
-    // If Groq key provided, try to download and transcribe audio
+    // If Groq key provided + audio available, transcribe
     if (apiKey && info.audioUrl) {
       try {
-        const audioRes = await fetch(info.audioUrl, {
-          signal: AbortSignal.timeout(120000),
-        });
+        const audioRes = await fetch(info.audioUrl, { signal: AbortSignal.timeout(120000) });
         if (audioRes.ok) {
           const audioBuffer = await audioRes.arrayBuffer();
           if (audioBuffer.byteLength <= 25 * 1024 * 1024) {
             const { transcribeWithGroq, analyzeWithGroq } = await import("@/lib/groq-client");
             const transcript = await transcribeWithGroq(audioBuffer, apiKey, language);
             const analysis = await analyzeWithGroq(transcript.text, transcript.segments, apiKey, language);
-
-            return NextResponse.json({
-              ...info,
-              transcript: transcript.text,
-              segments: transcript.segments,
-              ...analysis,
-              provider: "groq",
-            });
+            return NextResponse.json({ ...info, transcript: transcript.text, segments: transcript.segments, ...analysis, provider: "groq" });
           }
         }
-      } catch (groqErr) {
-        console.error("Groq error:", groqErr);
-      }
+      } catch (e) { console.error("Groq error:", e); }
     }
 
     return NextResponse.json({
       ...info,
-      note: info.audioUrl
-        ? "Video encontrado com sucesso. Adicione chave Groq (gratis) para transcricao IA."
-        : "Video encontrado, mas nao foi possivel extrair audio.",
+      note: info.audioUrl ? "Video encontrado. Adicione chave Groq (gratis) para IA." : "Metadados extraidos.",
     });
   } catch (err) {
     console.error(err);
-    return NextResponse.json(
-      { error: "Erro interno. Tente novamente." },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Erro interno" }, { status: 500 });
   }
 }
