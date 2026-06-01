@@ -8,6 +8,7 @@ import {
 import { toast } from "sonner";
 import { extractKeywords, generateTags, generateHashtags, formatForExport } from "@/lib/seo";
 import { generateAllThumbnailsFromImage } from "@/lib/thumbnail";
+import { downloadFullVideo, cutVideo, type ClipJob } from "@/lib/clipper-wasm";
 
 interface Topic {
   index: number;
@@ -174,6 +175,9 @@ export default function Home() {
   const [seoHashtags, setSeoHashtags] = useState<string[]>([]);
   const [seoDescription, setSeoDescription] = useState("");
   const [cutScript, setCutScript] = useState("");
+  const [cutting, setCutting] = useState(false);
+  const [cutProgress, setCutProgress] = useState({ current: 0, total: 0, status: "" });
+  const [clips, setClips] = useState<{ index: number; title: string; blob: Blob; url: string }[]>([]);
 
   const handleSubmit = async () => {
     if (!url) return;
@@ -260,6 +264,74 @@ export default function Home() {
     });
     lines.push(`echo "✅ ${t.length} cortes em clips/"`);
     setCutScript(lines.join("\n"));
+  };
+
+  const handleCut = async () => {
+    if (!videoData || topics.length === 0) return;
+
+    const videoFmt = videoData.formats.find(f =>
+      f.mimeType.includes("video/mp4") && f.contentLength
+    ) || videoData.formats.find(f => f.mimeType.includes("video"));
+
+    const audioFmt = videoData.formats.find(f =>
+      f.mimeType.includes("audio")
+    );
+
+    // Prefer combined format (progressive) for simplicity
+    const bestFmt = videoData.formats.find(f =>
+      f.mimeType.includes("video/mp4") && f.url.includes("mime=video")
+    ) || videoFmt || audioFmt;
+
+    if (!bestFmt?.url) {
+      toast.error("Nenhum formato disponivel para download");
+      return;
+    }
+
+    const sizeMB = bestFmt.contentLength
+      ? parseInt(bestFmt.contentLength) / 1024 / 1024
+      : 0;
+
+    if (sizeMB > 500) {
+      toast.error(`Video muito grande (${sizeMB.toFixed(0)}MB). Use o script bash local.`);
+      return;
+    }
+
+    setCutting(true);
+    setClips([]);
+    setCutProgress({ current: 0, total: 0, status: "Baixando video..." });
+
+    try {
+      // Download full video
+      const videoBuffer = await downloadFullVideo(bestFmt.url, (pct) => {
+        setCutProgress({ current: 0, total: topics.length, status: `Baixando video... ${pct}%` });
+      });
+
+      // Cut clips
+      const clipJobs: ClipJob[] = topics.map(t => ({
+        index: t.index,
+        title: t.title,
+        start: t.start,
+        end: t.end,
+      }));
+
+      const results = await cutVideo(videoBuffer, clipJobs, (current, total, status) => {
+        setCutProgress({ current, total, status });
+      });
+
+      const clipsWithUrls = results.map(r => ({
+        ...r,
+        url: URL.createObjectURL(r.blob),
+      }));
+
+      setClips(clipsWithUrls);
+      setCutting(false);
+      setCutProgress({ current: topics.length, total: topics.length, status: "Concluido!" });
+      toast.success(`${clipsWithUrls.length} clips prontos!`);
+    } catch (e) {
+      setCutting(false);
+      setCutProgress({ current: 0, total: 0, status: "" });
+      toast.error(e instanceof Error ? e.message : "Erro ao cortar video");
+    }
   };
 
   const generateThumbnails = async () => {
@@ -369,7 +441,8 @@ export default function Home() {
               </div>
 
               {activeTab === "topics" && (
-                <div className="space-y-3">
+                <div className="space-y-4">
+                  {/* Topics */}
                   {topics.map(topic => (
                     <div key={topic.index} className="bg-card border rounded-xl p-4">
                       <div className="flex items-start gap-3">
@@ -386,6 +459,75 @@ export default function Home() {
                       </div>
                     </div>
                   ))}
+
+                  {/* Cutting Section */}
+                  <div className="bg-card border rounded-2xl p-6">
+                    <h3 className="font-semibold flex items-center gap-2 mb-1">
+                      <Scissors className="w-5 h-5 text-tint" />
+                      Cortar Clipes de Video
+                    </h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Baixa o video e corta cada topico em um arquivo MP4 separado, pronto pra upload.
+                    </p>
+
+                    {!cutting && clips.length === 0 && (
+                      <button
+                        onClick={handleCut}
+                        disabled={topics.length === 0}
+                        className="w-full sm:w-auto px-5 py-3 bg-tint text-tint-foreground rounded-xl font-medium text-sm hover:opacity-90 disabled:opacity-50 flex items-center gap-2"
+                      >
+                        <Download className="w-4 h-4" />
+                        Baixar Video e Cortar {topics.length} Clipes
+                      </button>
+                    )}
+
+                    {cutting && (
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-3">
+                          <div className="w-5 h-5 border-2 border-tint/30 border-t-tint rounded-full animate-spin" />
+                          <span className="text-sm">{cutProgress.status}</span>
+                        </div>
+                        <div className="h-2 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-tint transition-all duration-300 rounded-full"
+                            style={{ width: `${cutProgress.total > 0 ? (cutProgress.current / cutProgress.total) * 100 : 0}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {clips.length > 0 && !cutting && (
+                      <div className="space-y-2">
+                        <p className="text-sm text-success font-medium mb-2">
+                          {clips.length} clipes prontos!
+                        </p>
+                        {clips.map(clip => (
+                          <div key={clip.index} className="flex items-center justify-between bg-muted/50 rounded-lg px-4 py-3">
+                            <div className="flex items-center gap-3 min-w-0">
+                              <span className="text-xs font-mono bg-background px-2 py-0.5 rounded">#{clip.index}</span>
+                              <span className="text-sm truncate">{clip.title}</span>
+                              <span className="text-xs text-muted-foreground shrink-0">
+                                {(clip.blob.size / 1024 / 1024).toFixed(1)} MB
+                              </span>
+                            </div>
+                            <a
+                              href={clip.url}
+                              download={`clip_${String(clip.index).padStart(2, "0")}.mp4`}
+                              className="text-xs text-tint hover:underline flex items-center gap-1 shrink-0 ml-3"
+                            >
+                              <Download className="w-3 h-3" /> Baixar
+                            </a>
+                          </div>
+                        ))}
+                        <button
+                          onClick={() => { setClips([]); setCutProgress({ current: 0, total: 0, status: "" }); }}
+                          className="text-xs text-muted-foreground hover:text-foreground mt-2"
+                        >
+                          Limpar e cortar novamente
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 
