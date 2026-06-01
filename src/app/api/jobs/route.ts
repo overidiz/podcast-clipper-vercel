@@ -6,122 +6,103 @@ function extractVideoId(url: string): string | null {
   return m ? m[1] : null;
 }
 
-const INVIDIOUS_INSTANCES = [
-  "https://inv.nadeko.net",
-  "https://invidious.fdn.fr",
-  "https://yewtu.be",
-  "https://vid.puffyan.us",
-  "https://invidious.privacyredirect.com",
-  "https://iv.ggtyler.dev",
-];
+async function fetchWithProxy(url: string): Promise<string | null> {
+  // Try direct first, then via proxy
+  try {
+    const direct = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (direct.ok) return await direct.text();
+  } catch {}
 
-async function fetchInvidious(videoId: string) {
-  for (const base of INVIDIOUS_INSTANCES) {
+  // Via CORS proxy
+  const proxies = [
+    (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  ];
+
+  for (const proxyFn of proxies) {
     try {
-      const res = await fetch(`${base}/api/v1/videos/${videoId}`, {
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-
-      const formats = (data.adaptiveFormats || [])
-        .concat(data.formatStreams || [])
-        .filter((f: Record<string, unknown>) => f.url)
-        .map((f: Record<string, unknown>) => ({
-          url: f.url as string,
-          mimeType: (f.type as string) || (f.mimeType as string) || "",
-          itag: (f.itag as number) || 0,
-          contentLength: (f.clen as string) || (f.contentLength as string) || undefined,
-          qualityLabel: (f.qualityLabel as string) || (f.resolution as string) || undefined,
-        }));
-
-      return {
-        title: data.title as string || "",
-        duration: (data.lengthSeconds as number) || 0,
-        thumbnail: (data.videoThumbnails?.[0]?.url as string) || "",
-        formats,
-      };
-    } catch {
-      continue;
-    }
+      const res = await fetch(proxyFn(url), { signal: AbortSignal.timeout(12000) });
+      if (res.ok) return await res.text();
+    } catch {}
   }
   return null;
 }
 
-async function fetchOEmbed(videoId: string) {
+async function getFormats(videoId: string) {
+  // Method 1: InnerTube API via proxy
+  const apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const innerBody = JSON.stringify({
+    videoId,
+    context: {
+      client: { clientName: "WEB", clientVersion: "2.20250601.00.00", hl: "pt", gl: "BR", utcOffsetMinutes: -180 },
+    },
+  });
+
   try {
-    const res = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-      { signal: AbortSignal.timeout(8000) }
+    const innerRes = await fetch(
+      `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: innerBody,
+        signal: AbortSignal.timeout(10000),
+      }
     );
-    if (res.ok) {
-      const data = await res.json();
-      return {
-        title: data.title as string || "",
-        thumbnail: data.thumbnail_url as string || "",
-      };
+    if (innerRes.ok) {
+      const data = await innerRes.json();
+      if (data.videoDetails) {
+        return extractFormats(data);
+      }
     }
   } catch {}
-  return { title: "", thumbnail: "" };
+
+  // Method 2: YouTube watch page via proxy
+  const html = await fetchWithProxy(`https://www.youtube.com/watch?v=${videoId}`);
+  if (html) {
+    const start = html.indexOf("ytInitialPlayerResponse");
+    if (start !== -1) {
+      const braceStart = html.indexOf("{", start);
+      if (braceStart !== -1) {
+        let depth = 0, endIdx = braceStart;
+        for (let i = braceStart; i < html.length; i++) {
+          if (html[i] === "{") depth++;
+          else if (html[i] === "}" && --depth === 0) { endIdx = i + 1; break; }
+        }
+        try {
+          return extractFormats(JSON.parse(html.slice(braceStart, endIdx)));
+        } catch {}
+      }
+    }
+  }
+
+  return null;
 }
 
-async function fetchYouTubeHtml(videoId: string) {
-  for (const ua of [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-  ]) {
-    try {
-      const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-        headers: {
-          "User-Agent": ua,
-          "Accept-Language": "pt-BR,pt;q=0.9",
-          "Accept": "text/html",
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) continue;
-      const html = await res.text();
-      const start = html.indexOf("ytInitialPlayerResponse");
-      if (start === -1) continue;
-      const braceStart = html.indexOf("{", start);
-      if (braceStart === -1) continue;
-      let depth = 0, endIdx = braceStart;
-      for (let i = braceStart; i < html.length; i++) {
-        if (html[i] === "{") depth++;
-        else if (html[i] === "}" && --depth === 0) { endIdx = i + 1; break; }
+function extractFormats(data: Record<string, unknown>) {
+  const details = data.videoDetails as Record<string, unknown> || {};
+  const sd = data.streamingData as Record<string, unknown> || {};
+  const raw = [...(sd.adaptiveFormats as Record<string, unknown>[] || []), ...(sd.formats as Record<string, unknown>[] || [])];
+  const formats = raw
+    .map((f: Record<string, unknown>) => {
+      let u = (f.url as string) || "";
+      if (!u && f.signatureCipher) {
+        const p = new URLSearchParams(f.signatureCipher as string);
+        u = p.get("url") || "";
+        const s = p.get("s") || "";
+        if (s) u += `&sig=${s}`;
       }
-      const data = JSON.parse(html.slice(braceStart, endIdx));
-      if (!data.videoDetails) continue;
+      return { url: u, mimeType: (f.mimeType as string) || "", itag: f.itag, contentLength: f.contentLength, qualityLabel: f.qualityLabel };
+    })
+    .filter((f) => f.url);
 
-      const sd = data.streamingData || {};
-      const formats = [...(sd.adaptiveFormats || []), ...(sd.formats || [])]
-        .map((f: Record<string, unknown>) => {
-          let u = (f.url as string) || "";
-          if (!u && f.signatureCipher) {
-            const p = new URLSearchParams(f.signatureCipher as string);
-            u = p.get("url") || "";
-            const s = p.get("s") || "";
-            if (s) u += `&sig=${s}`;
-          }
-          return {
-            url: u,
-            mimeType: (f.mimeType as string) || "",
-            itag: f.itag as number,
-            contentLength: f.contentLength as string | undefined,
-            qualityLabel: f.qualityLabel as string | undefined,
-          };
-        })
-        .filter((f) => f.url);
+  const thumbs = ((details.thumbnail as Record<string, unknown>)?.thumbnails as { url: string }[]) || [];
 
-      return {
-        title: (data.videoDetails.title as string) || "",
-        duration: parseInt((data.videoDetails.lengthSeconds as string) || "0", 10),
-        thumbnail: "",
-        formats,
-      };
-    } catch { continue; }
-  }
-  return null;
+  return {
+    title: (details.title as string) || "",
+    duration: parseInt((details.lengthSeconds as string) || "0", 10),
+    thumbnail: thumbs[thumbs.length - 1]?.url || "",
+    formats,
+  };
 }
 
 export async function POST(req: NextRequest) {
@@ -132,27 +113,33 @@ export async function POST(req: NextRequest) {
     const videoId = extractVideoId(url);
     if (!videoId) return NextResponse.json({ error: "URL invalida" }, { status: 400 });
 
-    // 1. Try Invidious (best - returns formats with CORS-friendly URLs)
-    let invidious = await fetchInvidious(videoId);
+    // Get formats (InnerTube direct + YouTube page via proxy as fallback)
+    let data = await getFormats(videoId);
+    let title = data?.title || "";
+    let duration = data?.duration || 0;
+    let thumbnail = data?.thumbnail || "";
+    let formats = data?.formats || [];
 
-    // 2. Try YouTube HTML (may be blocked by IP)
-    let ytData = await fetchYouTubeHtml(videoId);
+    // Fallback: oEmbed for metadata only
+    if (!title) {
+      try {
+        const oembedRes = await fetch(
+          `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (oembedRes.ok) {
+          const oembed = await oembedRes.json();
+          title = oembed.title || "";
+          thumbnail = oembed.thumbnail_url || "";
+        }
+      } catch {}
+    }
 
-    // 3. Always get oEmbed metadata as fallback
-    const oembed = await fetchOEmbed(videoId);
-
-    // Build response - prefer Invidious formats, then YouTube, then oEmbed metadata
-    const title = invidious?.title || ytData?.title || oembed.title || "Video do YouTube";
-    const duration = invidious?.duration || ytData?.duration || 0;
-    const thumbnail = invidious?.thumbnail || oembed.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-    const formats = invidious?.formats || ytData?.formats || [];
+    if (!title) title = "Video do YouTube";
+    if (!thumbnail) thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
     return NextResponse.json({
-      videoId,
-      title,
-      duration,
-      thumbnail,
-      formats,
+      videoId, title, duration, thumbnail, formats,
       hasFormats: formats.length > 0,
     });
   } catch (err) {
