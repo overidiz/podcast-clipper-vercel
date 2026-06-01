@@ -1,63 +1,71 @@
 import { NextRequest, NextResponse } from "next/server";
-// @ts-ignore
-import ytdl from "@distube/ytdl-core";
 
 function extractVideoId(url: string): string | null {
-  const patterns = [
-    /(?:v=|\/v\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
-    /(?:embed\/)([a-zA-Z0-9_-]{11})/,
-    /(?:shorts\/)([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const m = url.match(p);
-    if (m) return m[1];
-  }
-  return null;
+  const p = /(?:v=|\/v\/|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+  const m = url.match(p);
+  return m ? m[1] : url.length === 11 ? url : null;
 }
 
-async function getVideoInfo(videoId: string) {
+interface VideoInfo {
+  videoId: string;
+  title: string;
+  duration: number;
+  thumbnail: string;
+  audioUrl: string | null;
+  videoUrl: string | null;
+}
+
+async function getVideoInfo(videoId: string): Promise<VideoInfo | null> {
   try {
-    const info = await ytdl.getInfo(videoId);
-    const formats = info.formats;
+    // Fetch YouTube watch page and extract ytInitialPlayerResponse
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
 
-    // Pick best audio (opus > m4a)
-    const audioFormat =
-      formats.find((f: { hasAudio: boolean; hasVideo: boolean; codecs?: string }) =>
-        f.hasAudio && !f.hasVideo && f.codecs?.includes("opus")
-      ) ||
-      formats.find((f: { hasAudio: boolean; hasVideo: boolean }) =>
-        f.hasAudio && !f.hasVideo
-      );
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
 
-    // Pick best video (720p mp4)
-    const videoFormat =
-      formats.find((f: { hasVideo: boolean; hasAudio: boolean; qualityLabel?: string; container?: string }) =>
-        f.hasVideo && !f.hasAudio && f.qualityLabel === "720p" && f.container === "mp4"
-      ) ||
-      formats.find((f: { hasVideo: boolean; hasAudio: boolean; container?: string }) =>
-        f.hasVideo && !f.hasAudio && f.container === "mp4"
-      );
+    // Extract ytInitialPlayerResponse JSON
+    const jsonMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});\s*var/);
+    if (!jsonMatch) return null;
 
-    // Get best thumbnail
-    const thumbs = info.videoDetails.thumbnails || [];
-    const bestThumb = thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "";
+    const playerResponse = JSON.parse(jsonMatch[1]);
+    const details = playerResponse.videoDetails;
+    if (!details) return null;
+
+    const formats: Record<string, unknown>[] =
+      playerResponse.streamingData?.adaptiveFormats || [];
+
+    // Best audio (opus webm)
+    const audio = formats.find((f: Record<string, unknown>) =>
+      (f.mimeType as string)?.includes("audio") &&
+      !f.qualityLabel
+    );
+
+    // Best video (720p mp4, no audio)
+    const video = formats.find((f: Record<string, unknown>) =>
+      (f.mimeType as string)?.includes("video/mp4") &&
+      (f.qualityLabel as string) === "720p"
+    ) || formats.find((f: Record<string, unknown>) =>
+      (f.mimeType as string)?.includes("video/mp4")
+    );
+
+    const thumbs = details.thumbnail?.thumbnails || [];
 
     return {
       videoId,
-      title: info.videoDetails.title,
-      duration: parseInt(info.videoDetails.lengthSeconds || "0", 10),
-      thumbnail: bestThumb,
-      audioUrl: audioFormat?.url || null,
-      videoUrl: videoFormat?.url || null,
-      audioFormat: audioFormat
-        ? { itag: audioFormat.itag, mimeType: audioFormat.mimeType, contentLength: audioFormat.contentLength }
-        : null,
-      videoFormat: videoFormat
-        ? { itag: videoFormat.itag, mimeType: videoFormat.mimeType, contentLength: videoFormat.contentLength }
-        : null,
+      title: (details.title as string) || "Video",
+      duration: parseInt((details.lengthSeconds as string) || "0", 10),
+      thumbnail: thumbs[thumbs.length - 1]?.url || thumbs[0]?.url || "",
+      audioUrl: (audio?.url as string) || null,
+      videoUrl: (video?.url as string) || null,
     };
   } catch (err) {
-    console.error("ytdl error:", err);
+    console.error("getVideoInfo error:", err);
     return null;
   }
 }
@@ -68,21 +76,23 @@ export async function POST(req: NextRequest) {
     if (!url) return NextResponse.json({ error: "URL obrigatoria" }, { status: 400 });
 
     const videoId = extractVideoId(url);
-    if (!videoId) return NextResponse.json({ error: "URL invalida do YouTube" }, { status: 400 });
+    if (!videoId) return NextResponse.json({ error: "URL invalida" }, { status: 400 });
 
-    // Get video info via ytdl-core (pure JS, no external deps)
     const info = await getVideoInfo(videoId);
     if (!info) {
-      return NextResponse.json({ error: "Video nao encontrado ou indisponivel" }, { status: 404 });
+      return NextResponse.json({
+        error: "Nao foi possivel acessar o video. Verifique se o link esta correto e se o video e publico.",
+      }, { status: 404 });
     }
 
-    // Download audio if Groq key provided
+    // If Groq key provided, try to download and transcribe audio
     if (apiKey && info.audioUrl) {
       try {
-        const audioRes = await fetch(info.audioUrl, { signal: AbortSignal.timeout(120000) });
+        const audioRes = await fetch(info.audioUrl, {
+          signal: AbortSignal.timeout(120000),
+        });
         if (audioRes.ok) {
           const audioBuffer = await audioRes.arrayBuffer();
-
           if (audioBuffer.byteLength <= 25 * 1024 * 1024) {
             const { transcribeWithGroq, analyzeWithGroq } = await import("@/lib/groq-client");
             const transcript = await transcribeWithGroq(audioBuffer, apiKey, language);
@@ -102,15 +112,16 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Return video metadata
     return NextResponse.json({
       ...info,
-      note: "Video encontrado. Adicione chave Groq (gratis) para transcricao com IA e deteccao de topicos.",
+      note: info.audioUrl
+        ? "Video encontrado com sucesso. Adicione chave Groq (gratis) para transcricao IA."
+        : "Video encontrado, mas nao foi possivel extrair audio.",
     });
   } catch (err) {
     console.error(err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Erro interno" },
+      { error: "Erro interno. Tente novamente." },
       { status: 500 }
     );
   }
